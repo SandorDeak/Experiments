@@ -1,5 +1,21 @@
-//#define D3DX12_NO_STATE_OBJECT_HELPERS 1
-//#include "d3dx12.h"
+/* TODO
+
+fix uv spheres,
+tessellating sphere
+optimize mip levels
+add some profiling
+optimize perlin noise computing
+temporal and volume Perlin noise
+
+particles snap to implicit surfaces
+have some fun with bezier curves
+
+better graphics, not just point lights
+show some debug info (frame time, vertex count, root signature refresh)
+
+*/
+
+
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -376,7 +392,7 @@ struct UploadHeapAllocation
 };
 
 #define RESOURCE_MANAGER_RING_SIZE 3
-#define RESOURCE_MANAGER_UPLOAD_HEAP_SIZE (64*1024*1024)
+#define RESOURCE_MANAGER_UPLOAD_HEAP_SIZE (256*1024*1024)
 struct ResourceManager
 {
 	UploadHeap uploadHeaps[RESOURCE_MANAGER_RING_SIZE];
@@ -945,6 +961,70 @@ struct Mesh
 	u32 indexCount;
 };
 
+struct GPUMesh
+{
+	VertexBuffer vertexBuffer;
+	IndexBuffer indexBuffer;
+	u32 indexCount;
+};
+
+static GPUMesh createGPUMesh(ResourceManager* resourceManager, Mesh* mesh)
+{
+	GPUMesh result = {};
+
+	result.vertexBuffer = createVertexBuffer(resourceManager, mesh->vertexCount * sizeof(Vertex), sizeof(Vertex), mesh->vertices);
+	result.indexBuffer = createIndexBuffer(resourceManager, mesh->indexCount * sizeof(u32), true, mesh->indices);
+	result.indexCount = mesh->indexCount;
+
+	return result;
+}
+
+inline b32 readyToDraw(ID3D12GraphicsCommandList* commandList, ID3D12CommandQueue* commandQueue, ID3D12Fence* fence, u64 requiredFenceValue, GPUMesh* mesh)
+{
+	b32 result = true;
+
+	if (mesh->vertexBuffer.resource.stateAfterModification != D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
+	{
+		if (resourceReady(&mesh->vertexBuffer.resource))
+		{
+			markModify(&mesh->vertexBuffer.resource, commandQueue, commandList, fence, requiredFenceValue,
+				D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		}
+		else
+		{
+			result = false;
+		}
+	}
+
+	if (mesh->indexBuffer.resource.stateAfterModification != D3D12_RESOURCE_STATE_INDEX_BUFFER)
+	{
+		if (resourceReady(&mesh->indexBuffer.resource))
+		{
+			markModify(&mesh->indexBuffer.resource, commandQueue, commandList, fence, requiredFenceValue,
+				D3D12_RESOURCE_STATE_INDEX_BUFFER);
+		}
+		else
+		{
+			result = false;
+		}
+	}
+
+	return result;
+}
+
+inline void bindBuffers(ID3D12GraphicsCommandList* commandList, ID3D12CommandQueue* commandQueue, ID3D12Fence* fence, u64 requiredFenceValue, GPUMesh* mesh)
+{
+	markUse(&mesh->vertexBuffer.resource, commandQueue, fence, requiredFenceValue);
+	markUse(&mesh->indexBuffer.resource, commandQueue, fence, requiredFenceValue);
+	commandList->IASetIndexBuffer(&mesh->indexBuffer.d12View);
+	commandList->IASetVertexBuffers(0, 1, &mesh->vertexBuffer.d12View);
+}
+
+inline void drawIndexed(ID3D12GraphicsCommandList* commandList, GPUMesh* mesh)
+{
+	commandList->DrawIndexedInstanced(mesh->indexCount, 1, 0, 0, 0);
+}
+
 
 #define fetchSample(image, u, v, type) (*(type*)((image)->memory + (image)->pitch*(v) + sizeof(type)*(u)))
 
@@ -1286,6 +1366,61 @@ static Mesh createCubeMesh(MemoryArena* arena)
 	return result;
 }
 
+static Mesh createPlaneMesh(MemoryArena* arena, v2 tileSize, u32 tileCountX, u32 tileCountZ)
+{
+	ASSERT(tileCountX > 0);
+	ASSERT(tileCountZ > 0);
+
+	Mesh result = {};
+
+	u32 vertexCountX = tileCountX + 1;
+	u32 vertexCountZ = tileCountZ + 1;
+	u32 vertexCount = vertexCountX * vertexCountZ;
+	u32 triangleCount = tileCountX * tileCountZ * 2;
+	u32 indexCount = 3 * triangleCount;
+
+	Vertex* vertices = pushArray(arena, vertexCount, Vertex);
+	u32* indices = pushArray(arena, indexCount, u32);
+
+	Vertex* vertexAt = vertices;
+	for (u32 vertexIndexZ = 0; vertexIndexZ < vertexCountZ; ++vertexIndexZ)
+	{
+		for (u32 vertexIndexX = 0; vertexIndexX < vertexCountX; ++vertexIndexX)
+		{
+			Vertex* newVertex = vertexAt++;
+			newVertex->position = { (f32)vertexIndexX * tileSize.x, 0.f, (f32)vertexIndexZ * tileSize.y };
+			newVertex->normal = { 0.f, 1.f, 0.f };
+			newVertex->tangent = { 1.f, 0.f, 0.f };
+			newVertex->bitangent = { 0.f, 0.f, 1.f };
+			newVertex->uv = { (f32)vertexIndexX / (f32)tileCountX, (f32)vertexIndexZ / (f32)tileCountZ };
+		}
+	}
+	ASSERT(vertices + vertexCount == vertexAt);
+
+	u32* indexAt = indices;
+	for (u32 tileIndexZ = 0; tileIndexZ < tileCountZ; ++tileIndexZ)
+	{
+		for (u32 tileIndexX = 0; tileIndexX < tileCountX; ++tileIndexX)
+		{
+			*indexAt++ = tileIndexX + tileIndexZ * vertexCountX;
+			*indexAt++ = tileIndexX + (tileIndexZ + 1)*vertexCountX;
+			*indexAt++ = tileIndexX + 1 + tileIndexZ * vertexCountX;
+
+			*indexAt++ = tileIndexX + (tileIndexZ + 1)*vertexCountX;
+			*indexAt++ = tileIndexX + 1 + (tileIndexZ + 1)*vertexCountX;
+			*indexAt++ = tileIndexX + 1 + tileIndexZ * vertexCountX;
+		}
+	}
+	ASSERT(indices + indexCount == indexAt);
+
+	result.indexCount = indexCount;
+	result.indices = indices;
+	result.vertexCount = vertexCount;
+	result.vertices = vertices;
+
+	return result;
+}
+
 static v4 unpackColor(u32 color)
 {
 	v4 result =
@@ -1311,7 +1446,7 @@ static u32 packColor(v4 color)
 	return (a << 24) | (b << 16) | (g << 8) | (r << 0);
 }
 
-static void generateMipLevels(MemoryArena* arena, Image2DLod* image, u32 pitchAlign)
+static void generateMipLevels4U8(MemoryArena* arena, Image2DLod* image, u32 pitchAlign)
 {
 
 	ASSERT(image->lodCount == 1);
@@ -1368,6 +1503,63 @@ static void generateMipLevels(MemoryArena* arena, Image2DLod* image, u32 pitchAl
 	}
 }
 
+static void generateMipLevels1F32(MemoryArena* arena, Image2DLod* image, u32 pitchAlign)
+{
+
+	ASSERT(image->lodCount == 1);
+
+	u32 width = image->lod[0].width;
+	u32 height = image->lod[0].height;
+	while (width > 1 || height > 1)
+	{
+		width = MAX(1, width >> 1);
+		height = MAX(1, height >> 1);
+
+		ASSERT(image->lodCount < ARRAY_SIZE(image->lod));
+		Image2D* prevImage = image->lod + (image->lodCount - 1);
+
+		Image2D* newImage = image->lod + image->lodCount++;
+		*newImage = pushImage2D(arena, width, height, f32, pitchAlign);
+		u8* row = newImage->memory;
+		for (u32 y = 0; y < newImage->height; ++y)
+		{
+			f32 v = ((f32)y + 0.5f) * (f32)prevImage->height / (f32)newImage->height;
+			v -= 0.5f;
+			ASSERT(v >= 0.f);
+
+			u32 v0 = (u32)v;
+			u32 v1 = v0 + 1;
+			v1 = MIN(v1, prevImage->height);
+			f32 dv = v - (f32)v0;
+
+			f32* pixel = (f32*)row;
+			for (u32 x = 0; x < newImage->width; ++x)
+			{
+				f32 u = ((f32)x + 0.5f) * (f32)prevImage->width / (f32)newImage->width;
+				u -= 0.5f;
+				ASSERT(u >= 0.f);
+
+				u32 u0 = (u32)u;
+				u32 u1 = u0 + 1;
+				u1 = MIN(u1, prevImage->width);
+				f32 du = u - (f32)u0;
+
+				f32 c00 = fetchSample(prevImage, u0, v0, f32);
+				f32 c10 = fetchSample(prevImage, u1, v0, f32);
+				f32 c01 = fetchSample(prevImage, u0, v1, f32);
+				f32 c11 = fetchSample(prevImage, u1, v1, f32);
+
+				f32 a = lerp(c00, c10, du);
+				f32 b = lerp(c01, c11, du);
+				f32 c = lerp(a, b, dv);
+
+				*pixel++ = c;
+			}
+			row += newImage->pitch;
+		}
+	}
+}
+
 
 int CALLBACK WinMain(
 	HINSTANCE hInstance,
@@ -1377,7 +1569,7 @@ int CALLBACK WinMain(
 )
 {
 	ASSERT(QueryPerformanceFrequency(&g_perfCounterFrequency) == TRUE);
-	umm storageSize = 256 * 1024 * 1024;
+	umm storageSize = 512 * 1024 * 1024;
 	MemoryArena arena = createMemoryArena(Win32AllocateMemory(storageSize), storageSize);
 
 #ifdef _DEBUG
@@ -1576,15 +1768,15 @@ int CALLBACK WinMain(
 			InitAsConstantsBufferView(1, 0, D3D12_SHADER_VISIBILITY_ALL),
 		};
 		D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
-		samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-		samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-		samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 		samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 		samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
-		samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-		samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-		samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 		samplers[1].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
 		samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 		samplers[1].ShaderRegister = 1;
@@ -1663,10 +1855,24 @@ int CALLBACK WinMain(
 		rebuildGraphicsPipeline(device, &graphicsPipeline);
 	}
 
+
+	u32 terrainTileCount = 2048;
+	f32 terrainTileSize = 0.1f;
+	f32 terrainMaxHeight = 10.f;
+
+	ResourceManager resourceManager = ResourceManager::create(device);
+	
 	//create depth, vertex, index buffer
 	TempMemory tempMem = startTempMemory(&arena);
 	Mesh cubeMesh = createCubeMesh(&arena);
 	Mesh sphereMesh = createSphereMesh(&arena, 512, 512);
+	Mesh planeMesh = createPlaneMesh(&arena, { terrainTileSize, terrainTileSize }, terrainTileCount, terrainTileCount);
+
+	GPUMesh cube = createGPUMesh(&resourceManager, &cubeMesh);
+	GPUMesh sphere = createGPUMesh(&resourceManager, &sphereMesh);
+	GPUMesh plane = createGPUMesh(&resourceManager, &planeMesh);
+
+	endTempMemory(&tempMem);
 
 	ID3D12Resource* depthBuffer = 0;
 
@@ -1683,10 +1889,6 @@ int CALLBACK WinMain(
 		IID_PPV_ARGS(&depthBuffer)
 	) == S_OK);
 
-	ResourceManager resourceManager = ResourceManager::create(device);
-	VertexBuffer vb = createVertexBuffer(&resourceManager, sphereMesh.vertexCount * sizeof(Vertex), sizeof(Vertex), sphereMesh.vertices);
-	IndexBuffer ib = createIndexBuffer(&resourceManager, sphereMesh.indexCount * sizeof(u32), true, sphereMesh.indices);
-	endTempMemory(&tempMem);
 	
 	ConstantBuffer cbs[backBufferCount] = {};
 
@@ -1699,9 +1901,6 @@ int CALLBACK WinMain(
 
 	u64 fenceValue = 0;
 
-	D3D12_VERTEX_BUFFER_VIEW vbv = vb.d12View;
-	D3D12_INDEX_BUFFER_VIEW ibv = ib.d12View;
-	
 	//create dsv heap
 	ID3D12DescriptorHeap* dsvHeap = createDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
 
@@ -1719,35 +1918,41 @@ int CALLBACK WinMain(
 	u32 srvHeapIncrementSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	
 	//create diffuse texture
-	u32 texWidth = 4096;
-	u32 texHeight = 4096;
-	u32 texSize = texWidth * texHeight * 4;
 	tempMem = startTempMemory(&arena);
-	Image2D heightMap = pushImage2D(&arena, texWidth, texHeight, f32, 0);
+	Image2DLod heightMap = {};
+	heightMap .lod[0]= pushImage2D(&arena, terrainTileCount, terrainTileCount, f32, 0);
+	heightMap.lodCount = 1;
 	Image2DLod normalMap = {};
-	normalMap.lod[0] = pushImage2D(&arena, texWidth, texHeight, u32, 0);
+	normalMap.lod[0] = pushImage2D(&arena, terrainTileCount, terrainTileCount, u32, 0);
 	normalMap.lodCount = 1;
 	Image2D grad = pushImage2D(&arena, 64, 64, v2, 0);
 
 	fillWithRandomGradients(&grad, 13);
-	clearImage2D(&heightMap);
+	clearImage2D(&heightMap.lod[0]);
 
 	u32 tileSize = 1024;
 	u32 scale = 1;
 	v2 info{};
+	f32 maxHeight = 20.f;
 	for (u32 iter = 0; iter < 10; ++iter)
 	{
-		info = addPerlinNoise(&heightMap, &grad, { (f32)tileSize, 0.f }, 1.f / (f32)scale);
+		info = addPerlinNoise(&heightMap.lod[0], &grad, { (f32)tileSize, 0.f }, maxHeight / (f32)scale);
 		tileSize >>= 1;
 		scale <<= 1;
 	}
-	fillNormalMapForHeightMap(&heightMap, &normalMap.lod[0], 0.05f);
 
-	generateMipLevels(&arena, &normalMap, 0);
+	generateMipLevels1F32(&arena, &heightMap, 0);
+	generateMipLevels4U8(&arena, &normalMap, 0);
+
+	for (u32 lod = 0; lod < heightMap.lodCount; ++lod)
+	{
+		fillNormalMapForHeightMap(&heightMap.lod[lod], &normalMap.lod[lod], terrainTileSize * (f32)(1 << lod));
+	}
+
 
 	//u32* pixel = (u32*)image.memory;
-	//for (u32 y = 0; y < texHeight; ++y)
-	//{
+	//for (u32 y = 0; y < texHeight; ++ y)
+	//{ 
 	//	for (u32 x = 0; x < texWidth; ++x)
 	//	{
 	//		if (((x % 256) < 128) && ((y % 256) >= 128))
@@ -1775,16 +1980,14 @@ int CALLBACK WinMain(
 	
 	//heightMap
 	ID3D12Resource* heightMapResource = 0;
-	D3D12_RESOURCE_DESC heightTexDesc = createResourceDescTex2D(DXGI_FORMAT_R32_FLOAT, texWidth, texHeight, 0);
+	D3D12_RESOURCE_DESC heightTexDesc = createResourceDescTex2D(DXGI_FORMAT_R32_FLOAT, terrainTileCount, terrainTileCount, 0);
 	ASSERT(device->CreateCommittedResource(&createHeapProperties(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
 		&heightTexDesc, D3D12_RESOURCE_STATE_COPY_DEST, 0, IID_PPV_ARGS(&heightMapResource)) == S_OK);
 
 	TrackedResource heightTex = {};
 	heightTex.d12Resource = heightMapResource;
 	heightTex.stateAfterModification = D3D12_RESOURCE_STATE_COPY_DEST;
-	uploadToTexture(&resourceManager, &heightTex, &heightMap, DXGI_FORMAT_R32_FLOAT);
-
-	
+	uploadToTexture(&resourceManager, &heightTex, &heightMap.lod[0], DXGI_FORMAT_R32_FLOAT);
 	
 	endTempMemory(&tempMem);
 
@@ -1926,9 +2129,9 @@ int CALLBACK WinMain(
 				angle -= 200.f*3.14f;
 			}
 			m4 model = identityM4();
-			model = model * rotationY(angle*0.125f);
-			model = model * rotationX(angle*0.125f);
-			model.translation = { 0.f, 0.f, -20.f };
+			//model = model * rotationY(angle*0.125f);
+			//model = model * rotationX(angle*0.125f);
+			model.translation = { 0.f, -50.f, 0.f };
 
 			for (s32 modelIndexZ = 0; modelIndexZ < modelCountZ; ++modelIndexZ)
 			{
@@ -1937,14 +2140,14 @@ int CALLBACK WinMain(
 					for (s32 modelIndexX = 0; modelIndexX < modelCountX; ++modelIndexX)
 					{
 						ModelBuffer* modelBuffer = &modelBuffers[modelIndexZ][modelIndexY][modelIndexX];
-						modelBuffer->model = translation(3.f*V3(modelIndexX, modelIndexY, -modelIndexZ)) * model;
+						modelBuffer->model = translation(terrainTileSize*(f32)terrainTileCount*V3(modelIndexX, modelIndexY, -modelIndexZ)) * model;
 						modelBuffer->scale = V3(1.f);// { 1.3f, 1.f, 0.5f };
-						modelBuffer->vertexDisplacement = 0.5f + 0.5f*sinf(angle*0.1f);
+						modelBuffer->vertexDisplacement = 1.f;// 0.f*(1.f + sinf(angle*0.1f));
 						
 					}
 				}
 			}
-			//lightPos = (rotationY(angle * 0.125f) * v4 { 15.f, 0.f, 15.f, 1.f }).xyz;
+			lightPos = (rotationY(angle*0.5f) * v4 { 15.f, 0.f, 15.f, 1.f }).xyz;
 			//modelBuffers[0][0][0].model = translation(lightPos);
 		}
 
@@ -1992,39 +2195,7 @@ int CALLBACK WinMain(
 		commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
 		b32 canBeDrawn = true;
-		if (vb.resource.stateAfterModification != D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER )
-		{
-			if (resourceReady(&vb.resource))
-			{
-				markModify(&vb.resource, commandQueue, commandList, fence, fenceValue + 1,
-					D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-			}
-			else
-			{
-				canBeDrawn = false;
-			}
-		}
-		else
-		{
-			markUse(&vb.resource, commandQueue, fence, fenceValue + 1);
-		}
-
-		if (ib.resource.stateAfterModification != D3D12_RESOURCE_STATE_INDEX_BUFFER)
-		{
-			if (resourceReady(&ib.resource))
-			{
-				markModify(&ib.resource, commandQueue, commandList, fence, fenceValue + 1,
-					D3D12_RESOURCE_STATE_INDEX_BUFFER);
-			}
-			else
-			{
-				canBeDrawn = false;
-			}
-		}
-		else
-		{
-			markUse(&ib.resource, commandQueue, fence, fenceValue + 1);
-		}
+		
 
 		if (normalTex.stateAfterModification != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
 		{
@@ -2061,8 +2232,6 @@ int CALLBACK WinMain(
 
 
 
-		commandList->IASetVertexBuffers(0, 1, &vbv);
-		commandList->IASetIndexBuffer(&ibv);
 		commandList->SetDescriptorHeaps(1, &srvHeap);
 		
 		commandList->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
@@ -2088,8 +2257,12 @@ int CALLBACK WinMain(
 		commandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
 		commandList->SetGraphicsRootConstantBufferView(0, cbs[currentBackBufferIndex].gpuVirtualAddress);
 		
+		GPUMesh* meshToDraw = &plane;
+		canBeDrawn = readyToDraw(commandList, commandQueue, fence, fenceValue + 1, meshToDraw);
 		if (canBeDrawn)
 		{
+			bindBuffers(commandList, commandQueue, fence, fenceValue + 1, meshToDraw);
+
 			D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = modelCbs[currentBackBufferIndex].gpuVirtualAddress;
 			//for (u32 modelIndexZ = 0; modelIndexZ < modelCountZ; ++modelIndexZ)
 			{
@@ -2098,7 +2271,7 @@ int CALLBACK WinMain(
 					for (u32 modelIndexX = 0; modelIndexX < modelCountX; ++modelIndexX)
 					{
 						commandList->SetGraphicsRootConstantBufferView(2, gpuAddress);
-						commandList->DrawIndexedInstanced(sphereMesh.indexCount, 1, 0, 0, 0);
+						drawIndexed(commandList, meshToDraw);
 						gpuAddress += sizeof(ModelBuffer);
 					}
 				}
