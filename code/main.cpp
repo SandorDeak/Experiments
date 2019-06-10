@@ -663,132 +663,125 @@ struct ResourceManager // call it copy engine?
 	CommandQueue commandQueue;
 	u32 currentRingIndex;
 	ID3D12Device2* device;
-
-
-	UploadHeap* getCurrentUploadHeap() { return uploadHeaps + currentRingIndex; }
-	CommandAllocator* getCurrentCommandAllocator() { return commandAllocators + currentRingIndex; }
-	void advanceRing()
-	{
-		TIMED_BLOCK();
-
-		uploadHeaps[currentRingIndex].d12Resource->Unmap(0, 0);
-		currentRingIndex = (currentRingIndex + 1) % RESOURCE_MANAGER_RING_SIZE;
-
-		waitForFenceValue(commandQueue.d12fence, commandAllocators[currentRingIndex].requiredFenceValueForReset);
-		commandAllocators[currentRingIndex].d12CommandAllocator->Reset();
-		void* mappedHeap = 0;
-		uploadHeaps[currentRingIndex].d12Resource->Map(0, 0, &mappedHeap);
-		ASSERT(mappedHeap);
-		uploadHeaps[currentRingIndex].arena = createMemoryArena(mappedHeap, RESOURCE_MANAGER_UPLOAD_HEAP_SIZE);
-	}
-
-	UploadHeapAllocation allocateFromUploadHeap(umm size, umm alignment = 4)
-	{
-
-		ASSERT(size <= RESOURCE_MANAGER_UPLOAD_HEAP_SIZE);
-		UploadHeapAllocation result = {};
-		void* cpuMemory = pushSize(&uploadHeaps[currentRingIndex].arena, size, alignment);
-		if (!cpuMemory)
-		{
-			advanceRing();
-			cpuMemory = pushSize(&uploadHeaps[currentRingIndex].arena, size, alignment);
-		}
-		ASSERT(cpuMemory);
-
-		commandAllocators[currentRingIndex].requiredFenceValueForReset = commandQueue.lastSignaledFenceValue + 1;
-
-		result.cpuMemory = cpuMemory;
-		result.gpuMemoryOffset = getOffset(&uploadHeaps[currentRingIndex].arena, cpuMemory);
-		result.heap = uploadHeaps[currentRingIndex].d12Resource;
-
-		return result;
-	}
-
-	ID3D12GraphicsCommandList* startCommandList()
-	{
-		commandList.d12CommandList->Reset(commandAllocators[currentRingIndex].d12CommandAllocator, 0);
-		commandAllocators[currentRingIndex].requiredFenceValueForReset = commandQueue.lastSignaledFenceValue + 1;
-		return commandList.d12CommandList;
-	}
-
-	u64 submitCommandListAndSignal()
-	{
-		ASSERT(commandList.d12CommandList->Close() == S_OK);
-		ID3D12CommandList* commandLists[] = { commandList.d12CommandList };
-		commandQueue.d12commandQueue->ExecuteCommandLists(ARRAY_SIZE(commandLists), commandLists);
-		incrementAndSignal(commandQueue.d12commandQueue, commandQueue.d12fence, &commandQueue.lastSignaledFenceValue);
-		return commandQueue.lastSignaledFenceValue;
-	}
-	static ResourceManager create(ID3D12Device2* device)
-	{
-		ResourceManager result = {};
-
-		result.device = device;
-
-		//create uploadHeaps
-		for (s32 heapIndex = 0; heapIndex < ARRAY_SIZE(result.uploadHeaps); ++heapIndex)
-		{
-			UploadHeap* heap = result.uploadHeaps + heapIndex;
-
-			ASSERT(device->CreateCommittedResource(
-				&createHeapProperties(D3D12_HEAP_TYPE_UPLOAD),
-				D3D12_HEAP_FLAG_NONE,
-				&createResourceDescBuffer(RESOURCE_MANAGER_UPLOAD_HEAP_SIZE),
-				D3D12_RESOURCE_STATE_GENERIC_READ,
-				0,
-				IID_PPV_ARGS(&heap->d12Resource)
-			) == S_OK);
-
-		}
-		void* mappedHeap = 0;
-		result.uploadHeaps[0].d12Resource->Map(0, 0, &mappedHeap);
-		ASSERT(mappedHeap);
-		result.uploadHeaps[0].arena = createMemoryArena(mappedHeap, RESOURCE_MANAGER_UPLOAD_HEAP_SIZE);
-
-		//create command allocators
-		for (s32 commandAllocatorIndex = 0; commandAllocatorIndex < ARRAY_SIZE(result.commandAllocators); ++commandAllocatorIndex)
-		{
-			CommandAllocator* commandAllocator = result.commandAllocators + commandAllocatorIndex;
-			ASSERT(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
-				IID_PPV_ARGS(&commandAllocator->d12CommandAllocator)) == S_OK);
-		}
-
-		//create commandList
-		ASSERT(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, result.commandAllocators[0].d12CommandAllocator,
-			0, IID_PPV_ARGS(&result.commandList.d12CommandList)) == S_OK);
-		ASSERT(result.commandList.d12CommandList->Close() == S_OK);
-
-		//create commandQueue
-		D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-		queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-		queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-		ASSERT(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&result.commandQueue.d12commandQueue)) == S_OK);
-
-		//createFence
-		ASSERT(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&result.commandQueue.d12fence)) == S_OK);
-		
-
-		return result;
-	}
-
-	void release()
-	{
-		ASSERT(!"Not implemented");
-	}
 };
+
+static void _advanceRing(ResourceManager* resourceManager)
+{
+	TIMED_BLOCK();
+
+	resourceManager->uploadHeaps[resourceManager->currentRingIndex].d12Resource->Unmap(0, 0);
+	resourceManager->currentRingIndex = (resourceManager->currentRingIndex + 1) % RESOURCE_MANAGER_RING_SIZE;
+
+	waitForFenceValue(resourceManager->commandQueue.d12fence, resourceManager->commandAllocators[resourceManager->currentRingIndex].requiredFenceValueForReset);
+	resourceManager->commandAllocators[resourceManager->currentRingIndex].d12CommandAllocator->Reset();
+	
+	void* mappedHeap = 0;
+	resourceManager->uploadHeaps[resourceManager->currentRingIndex].d12Resource->Map(0, 0, &mappedHeap);
+	ASSERT(mappedHeap);
+	resourceManager->uploadHeaps[resourceManager->currentRingIndex].arena = createMemoryArena(mappedHeap, RESOURCE_MANAGER_UPLOAD_HEAP_SIZE);
+}
+
+static UploadHeapAllocation _allocateFromUploadHeap(ResourceManager* resourceManager, umm size, umm alignment = 4)
+{
+
+	ASSERT(size <= RESOURCE_MANAGER_UPLOAD_HEAP_SIZE);
+	UploadHeapAllocation result = {};
+	void* cpuMemory = pushSize(&resourceManager->uploadHeaps[resourceManager->currentRingIndex].arena, size, alignment);
+	if (!cpuMemory)
+	{
+		_advanceRing(resourceManager);
+		cpuMemory = pushSize(&resourceManager->uploadHeaps[resourceManager->currentRingIndex].arena, size, alignment);
+	}
+	ASSERT(cpuMemory);
+
+	resourceManager->commandAllocators[resourceManager->currentRingIndex].requiredFenceValueForReset = resourceManager->commandQueue.lastSignaledFenceValue + 1;
+
+	result.cpuMemory = cpuMemory;
+	result.gpuMemoryOffset = getOffset(&resourceManager->uploadHeaps[resourceManager->currentRingIndex].arena, cpuMemory);
+	result.heap = resourceManager->uploadHeaps[resourceManager->currentRingIndex].d12Resource;
+
+	return result;
+}
+
+static ID3D12GraphicsCommandList* _startCommandList(ResourceManager* resourceManager)
+{
+	resourceManager->commandList.d12CommandList->Reset(resourceManager->commandAllocators[resourceManager->currentRingIndex].d12CommandAllocator, 0);
+	resourceManager->commandAllocators[resourceManager->currentRingIndex].requiredFenceValueForReset = resourceManager->commandQueue.lastSignaledFenceValue + 1;
+	return resourceManager->commandList.d12CommandList;
+}
+
+static u64 _submitCommandListAndSignal(ResourceManager* resourceManager)
+{
+	ASSERT(resourceManager->commandList.d12CommandList->Close() == S_OK);
+	ID3D12CommandList* commandLists[] = { resourceManager->commandList.d12CommandList };
+	resourceManager->commandQueue.d12commandQueue->ExecuteCommandLists(ARRAY_SIZE(commandLists), commandLists);
+	incrementAndSignal(resourceManager->commandQueue.d12commandQueue, resourceManager->commandQueue.d12fence, &resourceManager->commandQueue.lastSignaledFenceValue);
+	return resourceManager->commandQueue.lastSignaledFenceValue;
+}
+static ResourceManager createResourceManager(ID3D12Device2* device)
+{
+	ResourceManager result = {};
+
+	result.device = device;
+
+	//create uploadHeaps
+	for (s32 heapIndex = 0; heapIndex < ARRAY_SIZE(result.uploadHeaps); ++heapIndex)
+	{
+		UploadHeap* heap = result.uploadHeaps + heapIndex;
+
+		ASSERT(device->CreateCommittedResource(
+			&createHeapProperties(D3D12_HEAP_TYPE_UPLOAD),
+			D3D12_HEAP_FLAG_NONE,
+			&createResourceDescBuffer(RESOURCE_MANAGER_UPLOAD_HEAP_SIZE),
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			0,
+			IID_PPV_ARGS(&heap->d12Resource)
+		) == S_OK);
+
+	}
+	void* mappedHeap = 0;
+	result.uploadHeaps[0].d12Resource->Map(0, 0, &mappedHeap);
+	ASSERT(mappedHeap);
+	result.uploadHeaps[0].arena = createMemoryArena(mappedHeap, RESOURCE_MANAGER_UPLOAD_HEAP_SIZE);
+
+	//create command allocators
+	for (s32 commandAllocatorIndex = 0; commandAllocatorIndex < ARRAY_SIZE(result.commandAllocators); ++commandAllocatorIndex)
+	{
+		CommandAllocator* commandAllocator = result.commandAllocators + commandAllocatorIndex;
+		ASSERT(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+			IID_PPV_ARGS(&commandAllocator->d12CommandAllocator)) == S_OK);
+	}
+
+	//create commandList
+	ASSERT(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, result.commandAllocators[0].d12CommandAllocator,
+		0, IID_PPV_ARGS(&result.commandList.d12CommandList)) == S_OK);
+	ASSERT(result.commandList.d12CommandList->Close() == S_OK);
+
+	//create commandQueue
+	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+	queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+	ASSERT(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&result.commandQueue.d12commandQueue)) == S_OK);
+
+	//createFence
+	ASSERT(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&result.commandQueue.d12fence)) == S_OK);
+	
+
+	return result;
+}
 
 static void uploadToBuffer(ResourceManager* resourceManager, TrackedResource* buffer, u64 offset, u64 size, void* data)
 {
-	UploadHeapAllocation alloc = resourceManager->allocateFromUploadHeap(size);
+	UploadHeapAllocation alloc = _allocateFromUploadHeap(resourceManager, size);
 	memcpy(alloc.cpuMemory, data, size);
 
 	u64 fenceValue = resourceManager->commandQueue.lastSignaledFenceValue + 1;
-	ID3D12GraphicsCommandList* commandList = resourceManager->startCommandList();
+	ID3D12GraphicsCommandList* commandList = _startCommandList(resourceManager);
 	markModify(buffer, resourceManager->commandQueue.d12commandQueue, commandList, resourceManager->commandQueue.d12fence,
 		fenceValue, D3D12_RESOURCE_STATE_COPY_DEST);
 	commandList->CopyBufferRegion(buffer->d12Resource, offset, alloc.heap, alloc.gpuMemoryOffset, size);
-	ASSERT(fenceValue == resourceManager->submitCommandListAndSignal());
+	ASSERT(fenceValue == _submitCommandListAndSignal(resourceManager));
 }
 
 struct Image2D
@@ -818,7 +811,7 @@ struct Image2DLodRegion
 static void uploadToTextureLod(ResourceManager* resourceManager, TrackedResource* texture, Image2DLod* imageLod, DXGI_FORMAT format, Image2DLodRegion* region = 0)
 {
 	u64 fenceValue = resourceManager->commandQueue.lastSignaledFenceValue + 1;
-	ID3D12GraphicsCommandList* commandList = resourceManager->startCommandList();
+	ID3D12GraphicsCommandList* commandList = _startCommandList(resourceManager);
 	markModify(texture, resourceManager->commandQueue.d12commandQueue, commandList, resourceManager->commandQueue.d12fence, fenceValue,
 		D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -831,7 +824,7 @@ static void uploadToTextureLod(ResourceManager* resourceManager, TrackedResource
 
 		u32 uploadHeapPitch = ALIGN_NUM(region->width*image->pixelSize, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
 		u64 size = region->height * uploadHeapPitch;
-		UploadHeapAllocation alloc = resourceManager->allocateFromUploadHeap(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+		UploadHeapAllocation alloc = _allocateFromUploadHeap(resourceManager, size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
 		
 		u8* row = image->memory + region->minX*image->pixelSize + region->minY*image->pitch;
 		u8* uploadHeapRow = (u8*)alloc.cpuMemory;
@@ -867,7 +860,7 @@ static void uploadToTextureLod(ResourceManager* resourceManager, TrackedResource
 		{
 			Image2D* image = imageLod->lod + lod;
 			u64 size = image->height * image->pitch;
-			UploadHeapAllocation alloc = resourceManager->allocateFromUploadHeap(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+			UploadHeapAllocation alloc = _allocateFromUploadHeap(resourceManager, size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
 			memcpy(alloc.cpuMemory, image->memory, size);
 
 			D3D12_TEXTURE_COPY_LOCATION src = {};
@@ -889,17 +882,17 @@ static void uploadToTextureLod(ResourceManager* resourceManager, TrackedResource
 			commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, 0);
 		}
 	}
-	ASSERT(fenceValue == resourceManager->submitCommandListAndSignal());
+	ASSERT(fenceValue == _submitCommandListAndSignal(resourceManager));
 }
 
 static void uploadToTexture(ResourceManager* resourceManager, TrackedResource* texture, Image2D* image, DXGI_FORMAT format)
 {
 	u64 size = image->height * image->pitch;
-	UploadHeapAllocation alloc = resourceManager->allocateFromUploadHeap(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+	UploadHeapAllocation alloc = _allocateFromUploadHeap(resourceManager, size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
 	memcpy(alloc.cpuMemory, image->memory, size);
 
 	u64 fenceValue = resourceManager->commandQueue.lastSignaledFenceValue + 1;
-	ID3D12GraphicsCommandList* commandList = resourceManager->startCommandList();
+	ID3D12GraphicsCommandList* commandList = _startCommandList(resourceManager);
 	markModify(texture, resourceManager->commandQueue.d12commandQueue, commandList, resourceManager->commandQueue.d12fence, fenceValue,
 		D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -920,7 +913,7 @@ static void uploadToTexture(ResourceManager* resourceManager, TrackedResource* t
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
 	commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, 0);
-	ASSERT(fenceValue == resourceManager->submitCommandListAndSignal());
+	ASSERT(fenceValue == _submitCommandListAndSignal(resourceManager));
 }
 
 static ConstantBuffer createConstantBuffer(ID3D12Device2* device, u32 size, D3D12_RESOURCE_STATES initState = D3D12_RESOURCE_STATE_COPY_DEST)
@@ -982,12 +975,12 @@ static VertexBuffer createVertexBuffer(ResourceManager* resourceManager, u64 siz
 		IID_PPV_ARGS(&d12Vb)
 	) == S_OK);
 
-	UploadHeapAllocation alloc = resourceManager->allocateFromUploadHeap(size);
+	UploadHeapAllocation alloc = _allocateFromUploadHeap(resourceManager, size);
 	memcpy(alloc.cpuMemory, data, size);
 
-	ID3D12GraphicsCommandList* commandList = resourceManager->startCommandList();
+	ID3D12GraphicsCommandList* commandList = _startCommandList(resourceManager);
 	commandList->CopyBufferRegion(d12Vb, 0, alloc.heap, alloc.gpuMemoryOffset, size);
-	u64 fenceValue = resourceManager->submitCommandListAndSignal();
+	u64 fenceValue = _submitCommandListAndSignal(resourceManager);
 	result.resource.d12Resource = d12Vb;
 	result.resource.modifyFenceSlot.d12Fence = resourceManager->commandQueue.d12fence;
 	result.resource.modifyFenceSlot.requiredFenceValue = fenceValue;
@@ -1013,12 +1006,12 @@ static IndexBuffer createIndexBuffer(ResourceManager* resourceManager, u64 size,
 		IID_PPV_ARGS(&d12Ib)
 	) == S_OK);
 
-	UploadHeapAllocation alloc = resourceManager->allocateFromUploadHeap(size);
+	UploadHeapAllocation alloc = _allocateFromUploadHeap(resourceManager, size);
 	memcpy(alloc.cpuMemory, data, size);
 
-	ID3D12GraphicsCommandList* commandList = resourceManager->startCommandList();
+	ID3D12GraphicsCommandList* commandList = _startCommandList(resourceManager);
 	commandList->CopyBufferRegion(d12Ib, 0, alloc.heap, alloc.gpuMemoryOffset, size);
-	u64 fenceValue = resourceManager->submitCommandListAndSignal();
+	u64 fenceValue = _submitCommandListAndSignal(resourceManager);
 
 	result.resource.d12Resource = d12Ib;
 	result.resource.modifyFenceSlot.d12Fence = resourceManager->commandQueue.d12fence;
@@ -4492,7 +4485,7 @@ int CALLBACK WinMain(
 	ASSERT(infoQueue->PushStorageFilter(&newFilter) == S_OK);
 #endif
 
-	ResourceManager resourceManager = ResourceManager::create(device);
+	ResourceManager resourceManager = createResourceManager(device);
 	Renderer renderer = {};
 	createRenderer(&renderer, window, device, 1024, 128, 1920, 1080, &arena);
 
