@@ -202,7 +202,7 @@ inline float cross(v2 a, v2 b)
 }
 inline v3 cross(v3 a, v3 b)
 {
-
+	return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
 }
 
 //a+=b
@@ -516,7 +516,28 @@ inline m4 translation(v3 translation)
 	return r;
 }
 
-inline v3 spherePoint(f32 u, f32 v)
+union m3x2
+{
+	v3 c[2];
+	f32 e[2][3];
+};
+
+union m2
+{
+	v2 c[2];
+	f32 e[2][2];
+};
+
+m3x2 operator*(m3x2 a, m2 b)
+{
+	m3x2 result;
+	result.c[0] = b.c[0].x*a.c[0] + b.c[0].y*a.c[1];
+	result.c[1] = b.c[1].x*a.c[0] + b.c[1].y*a.c[1];
+
+	return result;
+}
+
+inline v3 spherePos(f32 u, f32 v)
 {
 	u *= 2.f * pi32;
 	v *= pi32;
@@ -531,13 +552,13 @@ inline v3 spherePoint(f32 u, f32 v)
 	{
 		sin_v * cos_u,
 		cos_v,
-		-sin_v * sin_u,
+		sin_v * sin_u,
 	};
 
 	return result;
 }
 
-inline v3 dspherePointdu(f32 u, f32 v)
+inline m3x2 DspherePos(f32 u, f32 v)
 {
 	u *= 2.f * pi32;
 	v *= pi32;
@@ -548,46 +569,134 @@ inline v3 dspherePointdu(f32 u, f32 v)
 	f32 cos_v = cosf(v);
 	f32 sin_v = sinf(v);
 
-	v3 result =
+	m3x2 result;
+	result.c[0] =
 	{
 		-2.f*pi32*sin_u*sin_v,
 		0.f,
-		-2.f*pi32*cos_u*sin_v
+		2.f*pi32*cos_u*sin_v
 	};
 
-	return result;
-}
-
-inline v3 dspherePointdv(f32 u, f32 v)
-{
-	u *= 2.f * pi32;
-	v *= pi32;
-
-	f32 cos_u = cosf(u);
-	f32 sin_u = sinf(u);
-
-	f32 cos_v = cosf(v);
-	f32 sin_v = sinf(v);
-
-	v3 result =
+	result.c[1] =
 	{
 		cos_u*pi32*cos_v,
 		-pi32 * sin_v,
-		-sin_u*pi32*cos_v
+		sin_u*pi32*cos_v
 	};
 
 	return result;
 }
 
-inline f32 smoothStep(f32 t)
+inline v4 sphereShapeOp(f32 u, f32 v)
+{
+	v4 result = {};
+	result.xy = { 1.f, 0.f };
+	result.zw = { 0.f, 1.f };
+	return result;
+}
+
+inline v2 polarCoord(f32 u, f32 v)
+{
+	u *= 2.f*pi32;
+	v2 result = 0.5f*v * v2{ cosf(u), -sinf(u) } + v2{0.5f, 0.5f};
+	return result;
+}
+
+inline m2 DpolarCoord(f32 u, f32 v)
+{
+	u *= 2.f*pi32;
+	f32 cos_u = cosf(u);
+	f32 sin_u = sinf(u);
+
+	m2 result;
+	result.c[0] = pi32*v*v2{ -sin_u, -cos_u };
+	result.c[1] = 0.5f * v2{ cos_u, -sin_u };
+
+	return result;
+}
+
+inline m2 DpolarCoordInv(f32 u, f32 v)
+{
+	u *= 2.f*pi32;
+	f32 cos_u = cosf(u);
+	f32 sin_u = sinf(u);
+	if (v == 0.f)
+	{
+		v = 0.00001f;
+	}
+
+	m2 result;
+	result.c[0] = { -sin_u / (pi32*v), 2.f*cos_u };
+	result.c[1] = { -cos_u / (pi32*v), -2.f*sin_u };
+
+	return result;
+}
+
+inline v3 torusPos(f32 u, f32 v, f32 holeRadius)
+{
+	u *= 2.f*pi32;
+	v *= 2.f*pi32;
+	v3 result =
+	{
+		cosf(u)*(1.f + holeRadius + cosf(v)),
+		sinf(v),
+		-sinf(u)*(1.f + holeRadius + cosf(v))
+	};
+	return result;
+}
+
+inline v3 torusdPosdu(f32 u, f32 v, f32 holeRadius)
+{
+	u *= 2.f*pi32;
+	v *= 2.f*pi32;
+	v3 result
+	{
+		-2.f*pi32*sinf(u)*(1.f + holeRadius + cosf(v)),
+		0.f,
+		-2.f*pi32*cosf(u)*(1.f + holeRadius + cosf(v))
+	};
+	return result;
+}
+
+inline v3 torusdPosdv(f32 u, f32 v, f32 holeRadius)
+{
+	u *= 2.f*pi32;
+	v *= 2.f*pi32;
+	v3 result
+	{
+		-2.f*pi32*cosf(u)*sinf(v),
+		2.f*pi32*cosf(v),
+		2.f*pi32*sinf(u)*sinf(v)
+	};
+	return result;
+}
+
+inline v4 torusShapeOp(f32 u, f32 v, f32 holeRadius)
+{
+	u *= 2.f*pi32;
+	v *= 2.f*pi32;
+
+	v4 result = {};
+	result.xy = { cosf(v) / (1.f + holeRadius + cosf(v)), 0.f };
+	result.zw = { 0.f, 1.f };
+
+	return result;
+}
+
+inline f32 smoothStep1(f32 t)
+{
+	return t * t*(3.f - 2.f*t);
+}
+
+inline f32 smoothStep2(f32 t)
 {
 	return t * t*t*(10.f + t * (6.f*t - 15.f));
 }
 
-inline f32 smoothBlend(f32 a, f32 b, f32 t)
+inline f32 smoothBlend2(f32 a, f32 b, f32 t)
 {
 	//return smoothStep(1.f - t) * a + smoothStep(t) * b;
-	f32 s = smoothStep(t);
+	f32 s = smoothStep2(t);
 	return a + s * (b - a);
 }
 
@@ -641,4 +750,64 @@ inline v4 saturate(v4 v)
 		saturate(v.z),
 		saturate(v.w)
 	};
+}
+
+struct ClipRect
+{
+	u32 minX;
+	u32 maxX;
+	u32 minY;
+	u32 maxY;
+};
+
+//AVX
+inline __m256 operator+(__m256 a, __m256 b)
+{
+	return _mm256_add_ps(a, b);
+}
+
+inline __m256 operator*(__m256 a, __m256 b)
+{
+	return _mm256_mul_ps(a, b);
+}
+
+inline __m256 operator-(__m256 a, __m256 b)
+{
+	return _mm256_sub_ps(a, b);
+}
+
+inline __m256 operator/(__m256 a, __m256 b)
+{
+	return _mm256_div_ps(a, b);
+}
+
+union m256v2
+{
+	struct
+	{
+		__m256 x;
+		__m256 y;
+	};
+	__m256 e[2];
+};
+
+inline __m256 dot(m256v2 a, m256v2 b)
+{
+	return a.x*b.x + a.y*b.y;
+}
+
+inline __m256 smoothStep2(__m256 t)
+{
+	return t * t*t*(_mm256_set1_ps(10.f) + t * (_mm256_set1_ps(6.f)*t - _mm256_set1_ps(15.f)));
+}
+
+inline __m256 smoothBlend2(__m256 a, __m256 b, __m256 t)
+{
+	__m256 s = smoothStep2(t);
+	return a + s * (b - a);
+}
+
+inline __m256 lerp(__m256 a, __m256 b, __m256 t)
+{
+	return a + t * (b - a);
 }

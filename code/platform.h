@@ -39,3 +39,8 @@ typedef s32 b32;
 
 #define MAX(a, b) ((a) < (b) ? (b) : (a))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define CLAMP(a, b, t) (MAX(a, MIN(b,t)))
+
+#include <intrin.h>
+
+#define busyWaitWhile(expr) while(expr) {_mm_pause();}
