@@ -27,6 +27,9 @@ struct  SceneBuffer
 	uint lightCount;
 	LightBuffer lights[8];
 };
+ConstantBuffer<SceneBuffer> sceneBuffer : register(b0);
+
+#ifdef HEIGHT_MAPPING_SHADER_VS
 
 struct VertexIn
 {
@@ -38,40 +41,7 @@ struct VertexIn
 	float2 uv : UV;
 };
 
-ConstantBuffer<SceneBuffer> sceneBuffer : register(b0);
 ConstantBuffer<ModelBuffer> modelBuffer : register(b1);
-
-
-#ifdef SIMPLE_SHADER_VS
-
-struct VertexOut
-{
-	float3 normal: NORMAL;
-	float3 tangent: TANGENT;
-	float3 bitangent: BITANGENT;
-	float2 uv : UV;
-	float3 worldPos : WORLD_POS;
-	float4 position: SV_POSITION;
-};
-
-VertexOut simpleShaderVS(VertexIn vertexIn, uint id : SV_InstanceID)
-{
-	VertexOut result;
-
-	float4 worldPosition = mul(modelBuffer.model, float4(modelBuffer.scale * 
-		(vertexIn.position), 1.f));
-	result.worldPos = worldPosition.xyz;
-	result.position = mul(sceneBuffer.projview, worldPosition);
-	result.normal = mul(modelBuffer.model, float4(vertexIn.normal, 0.f)).xyz;
-	result.tangent = mul(modelBuffer.model, float4(vertexIn.tangent * modelBuffer.scale, 0.f)).xyz;
-	result.bitangent = mul(modelBuffer.model, float4(vertexIn.bitangent * modelBuffer.scale, 0.f)).xyz;
-	result.uv = vertexIn.uv;
-
-	return result;
-}
-#endif
-
-#ifdef HEIGHT_MAPPING_SHADER_VS
 
 Texture2D<float> heightMaps[2] : register(t2);
 SamplerState s : register(s0);
@@ -123,7 +93,28 @@ VertexOut heightMappingShaderVS(VertexIn vertexIn, uint id : SV_InstanceID)
 }
 #endif
 
+#ifdef LINE_SHADER_VS
+struct VertexOut
+{
+	float4 position: SV_POSITION;
+};
 
+VertexOut lineShaderVS(float3 position: POSITION)
+{
+	VertexOut result;
+	result.position = mul(sceneBuffer.projview, float4(position, 1.f));
+	return result;
+}
+#endif
+
+#ifdef LINE_SHADER_PS
+float4 lineShaderPS() : SV_TARGET
+{
+	return float4(1.f, 0.f, 0.f, 1.f);
+}
+#endif
+
+#if 0
 #ifdef TESS_SHADER
 
 #define CP_COUNT 3
@@ -326,36 +317,6 @@ DomainOut tessShaderDS(
 }
 
 #endif
-
-
-#ifdef FRACTAL_SHADER_PS 
-struct PixelIn
-{
-	float3 normal: NORMAL;
-	float3 tangent: TANGENT;
-	float3 bitangent: BITANGENT;
-	float2 uv : UV;
-	float3 lightDir : LIGHT_DIR;
-	float3 viewDir : VIEW_DIR;
-};
-
-Texture2D<float> fractalImage : register(t0);
-
-SamplerState s : register(s0);
-
-float4 fractalShaderPS(PixelIn pixelIn) : SV_Target
-{
-	float2 fractalUV = pixelIn.uv;
-
-	fractalUV = fractalUV - 0.5f;
-	fractalUV = fractalUV * modelBuffer.zoomScale;
-	fractalUV += 0.5f;
-
-	float fractal = 0.9f*fractalImage.SampleLevel(s, fractalUV, 2.f*(modelBuffer.zoomScale - 0.5f)) + 0.3f;
-	float3 color = fractal;
-
-	return float4(color, 1.f);
-}
 #endif
 
 //helper functions for PBR
@@ -453,6 +414,7 @@ struct PixelIn
 	float4 shapeOp : SHAPE_OP;
 };
 
+ConstantBuffer<ModelBuffer> modelBuffer : register(b1);
 Texture2D<float4> normalMap[2] : register(t0);
 Texture2D<float> heightMap[2] : register(t2);
 
@@ -498,8 +460,8 @@ float4 pbrNormalCalcShaderPS(PixelIn pixelIn) : SV_Target
 			nH /= nH.z;
 			dhdu = -nH.x * modelBuffer.vertexDisplacement * modelBuffer.heightMapFractalZoomScale;
 			dhdv = -nH.y * modelBuffer.vertexDisplacement * modelBuffer.heightMapFractalZoomScale;
-			
-			h  = heightMap[modelBuffer.heightMapFractalIndex].SampleLevel(s, fractalUV, 2.f*(modelBuffer.heightMapFractalZoomScale - 0.5f));
+
+			h = heightMap[modelBuffer.heightMapFractalIndex].SampleLevel(s, fractalUV, 2.f*(modelBuffer.heightMapFractalZoomScale - 0.5f));
 			h *= modelBuffer.vertexDisplacement;
 		}
 		else
@@ -511,31 +473,18 @@ float4 pbrNormalCalcShaderPS(PixelIn pixelIn) : SV_Target
 			dhdu = -nH.x * modelBuffer.vertexDisplacement;
 			dhdv = -nH.y * modelBuffer.vertexDisplacement;
 
-			h  = heightMap[0].Sample(s, pixelIn.uv);
+			h = heightMap[0].Sample(s, pixelIn.uv);
 			h *= modelBuffer.vertexDisplacement;
 		}
 
 		float3x3 TBN = { (pixelIn.tangent), (pixelIn.bitangent), normalize(pixelIn.normal) };
 		TBN = transpose(TBN);
-	
+
 		float3 t = mul(TBN, float3(1.f, 0.f, dhdu) + h * float3(w11, w12, 0.f));
 		float3 b = mul(TBN, float3(0.f, 1.f, dhdv) + h * float3(w21, w22, 0.f));
-	
+
 		n = normalize(cross(t, b));
-	
-		//float3 nS = normalize(pixelIn.normal);
-		//float3 dSdu = pixelIn.tangent;
-		//float3 dSdv = pixelIn.bitangent;
-		//
-		//float3 dnSdu = dSdu; //Only for Sphere!!!
-		//float3 dnSdv = dSdv; //Only for Sphere!!!
-		//
-		//
-		//float3 dfdu = dSdu + dhdu * nS + h * dnSdu;
-		//float3 dfdv = dSdv + dhdv * nS + h * dnSdv;
-		//
-		//n = -normalize(cross(dfdu, dfdv));
-	}	
+	}
 
 	float3 matColor = modelBuffer.color.xyz;
 	if (modelBuffer.fractalIndex >= 0)
@@ -547,7 +496,7 @@ float4 pbrNormalCalcShaderPS(PixelIn pixelIn) : SV_Target
 		fractalUV += 0.5f;
 
 		float4 fractal = fractalMaps[modelBuffer.fractalIndex].SampleLevel(s, fractalUV, 2.f*(modelBuffer.fractalZoomScale - 0.5f));
-		if (fractal.w == 1.f) //TODO: use a flag in modeSlBuffer!!!
+		if (fractal.w == 1.f) //TODO: use a flag in modelBuffer!!!
 		{
 			fractal.xyz = fractal.x;
 		}
@@ -599,19 +548,8 @@ float4 pbrNormalCalcShaderPS(PixelIn pixelIn) : SV_Target
 			result += color;
 		}
 	}
-	//result = w11 * w22;
-
-	//result = 0.5f*n + 0.5f;
-	//float2 fractalUV = pixelIn.uv;
-	//
-	//fractalUV = fractalUV - 0.5f;
-	//fractalUV = fractalUV * modelBuffer.heightMapFractalZoomScale;
-	//fractalUV += 0.5f;
-	//result = normalMap[modelBuffer.heightMapFractalIndex].SampleLevel(s, fractalUV, 2.f*(modelBuffer.heightMapFractalZoomScale - 0.5f));
+	
 	return float4(pow(result, 1.f/2.2f), 1.f);
 }
-
-
-
 #endif
 

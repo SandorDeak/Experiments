@@ -79,6 +79,8 @@ struct DebugTimer
 	}
 };
 
+global v3 G = { 0.f, 9.81f, 0.f };
+
 global DebugInfo g_debugInfo;
 
 #define __TIMED_BLOCK(count, tag) DebugTimer debugTimer##count (&g_debugInfo, tag);
@@ -961,7 +963,7 @@ static ConstantBuffer createConstantBuffer(ResourceManager* resourceManager, u32
 	return result;
 }
 
-static VertexBuffer createVertexBuffer(ResourceManager* resourceManager, u64 size, u64 stride, void* data)
+static VertexBuffer createVertexBuffer(ResourceManager* resourceManager, u32 size, u32 stride, void* data)
 {
 	VertexBuffer result = {};
 
@@ -985,8 +987,31 @@ static VertexBuffer createVertexBuffer(ResourceManager* resourceManager, u64 siz
 	result.resource.modifyFenceSlot.d12Fence = resourceManager->commandQueue.d12fence;
 	result.resource.modifyFenceSlot.requiredFenceValue = fenceValue;
 	result.resource.stateAfterModification = D3D12_RESOURCE_STATE_COPY_DEST;
-	result.d12View.SizeInBytes = (UINT)size;
-	result.d12View.StrideInBytes = (UINT)stride;
+	result.d12View.SizeInBytes = size;
+	result.d12View.StrideInBytes = stride;
+	result.d12View.BufferLocation = d12Vb->GetGPUVirtualAddress();
+
+	return result;
+}
+
+static VertexBuffer createVertexBuffer(ID3D12Device2* device, u32 size, u32 stride, D3D12_RESOURCE_STATES initState = D3D12_RESOURCE_STATE_COPY_DEST)
+{
+	VertexBuffer result = {};
+
+	ID3D12Resource* d12Vb = 0;
+	ASSERT(device->CreateCommittedResource(
+		&createHeapProperties(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&createResourceDescBuffer(size),
+		initState,
+		0,
+		IID_PPV_ARGS(&d12Vb)
+	) == S_OK);
+
+	result.resource.stateAfterModification = initState;
+	result.resource.d12Resource = d12Vb;
+	result.d12View.SizeInBytes = size;
+	result.d12View.StrideInBytes = stride;
 	result.d12View.BufferLocation = d12Vb->GetGPUVirtualAddress();
 
 	return result;
@@ -3710,7 +3735,87 @@ static void createHeightMappingPipeline(GraphicsPipeline* result, ID3D12Device2*
 	}
 }
 
-struct DrawSetting
+static void createLineDrawingPipeline(GraphicsPipeline* result, ID3D12Device2* device)
+{
+	*result = {};
+
+	{
+		ID3DBlob* signatureBlob = 0;
+		ID3DBlob* errorBlob = 0;
+
+		D3D12_ROOT_PARAMETER rootParams[] =
+		{
+			InitAsConstantsBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL),
+		};
+
+		D3D12_ROOT_SIGNATURE_DESC desc = {};
+		desc.Flags =
+			D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+		desc.NumParameters = ARRAY_SIZE(rootParams);
+		desc.pParameters = rootParams;
+		//desc.NumStaticSamplers = ARRAY_SIZE(samplers);
+		//desc.pStaticSamplers = samplers;
+
+		D3D12_FEATURE_DATA_ROOT_SIGNATURE featureData = {};
+		featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0; //setting it to 1_1 leads to error, I don't know why...
+		if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &featureData, sizeof(featureData))))
+		{
+			featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+		}
+		ASSERT(D3D12SerializeRootSignature(&desc, featureData.HighestVersion, &signatureBlob, &errorBlob) == S_OK);
+		ASSERT(device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(),
+			IID_PPV_ARGS(&result->desc.pRootSignature)) == S_OK);
+		signatureBlob->Release();
+	}
+
+	{
+		result->inputElementDescs[0] = createInputElementDesc("POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0);
+
+		result->desc.InputLayout = { result->inputElementDescs, 1 };
+
+		result->desc.DepthStencilState.DepthEnable = true;
+		result->desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+		result->desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		result->desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+
+		result->desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+		result->desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		result->desc.RasterizerState.FrontCounterClockwise = true;
+		result->desc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+		result->desc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+		result->desc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+		result->desc.RasterizerState.DepthClipEnable = TRUE;
+		result->desc.RasterizerState.MultisampleEnable = FALSE;
+		result->desc.RasterizerState.AntialiasedLineEnable = FALSE;
+		result->desc.RasterizerState.ForcedSampleCount = 0;
+		result->desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+		result->desc.BlendState.RenderTarget[0] =
+		{
+			FALSE,FALSE,
+			D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+			D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+			D3D12_LOGIC_OP_NOOP,
+			D3D12_COLOR_WRITE_ENABLE_ALL,
+		};
+
+		result->desc.SampleMask = UINT_MAX;
+		result->desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+		result->desc.NumRenderTargets = 1;
+		result->desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+		result->desc.SampleDesc.Count = 1;
+
+		result->shaders[SHADER_VERTEX].name = L"lineShaderVS.cso";
+		result->shaders[SHADER_PIXEL].name = L"lineShaderPS.cso";
+
+		rebuildGraphicsPipeline(device, result);
+	}
+}
+
+struct DrawModelSetting
 {
 	D3D12_VERTEX_BUFFER_VIEW vb;
 	D3D12_INDEX_BUFFER_VIEW ib;
@@ -3719,10 +3824,18 @@ struct DrawSetting
 	D3D12_GPU_DESCRIPTOR_HANDLE gpuDescriptorHandle;
 };
 
+struct DrawLineSetting
+{
+	u32 pointCount;
+	u32 firstPointIndex;
+	v4 color;
+};
+
 struct FrameResource
 {
 	ConstantBuffer gpuModelBuffers;
 	ConstantBuffer gpuSceneBuffer;
+	VertexBuffer gpuLineBuffer;
 
 	CommandAllocator commandAllocator;
 	ID3D12Resource* backbuffer;
@@ -3732,9 +3845,15 @@ struct FrameResource
 #define BACKBUFFER_COUNT 3
 struct Renderer
 {
-	DrawSetting* drawSettings;
+	DrawModelSetting* drawModelSettings;
 	u32 maxModelCount;
 	u32 modelCount;
+
+	DrawLineSetting* drawLineSettings;
+	u32 maxPointCount;
+	u32 pointCount;
+	u32 maxLineSettingCount;
+	u32 lineCount;
 
 	SceneBuffer sceneBuffer;
 
@@ -3743,6 +3862,7 @@ struct Renderer
 	FrameResource frameResources[BACKBUFFER_COUNT];
 	ModelBuffer* currentModelBuffers;
 	SceneBuffer* currentSceneBuffer;
+	v3* currentLineBuffer;
 
 
 	CommandQueue renderQueue;
@@ -3752,6 +3872,7 @@ struct Renderer
 	u8* uploadHeapBegin;
 	u32 modelBuffersOffset;
 	u32 sceneBufferOffset;
+	u32 lineBufferOffset;
 	u32 uploadHeapSizePerFrame;
 
 	ID3D12DescriptorHeap* descriptorHeap;
@@ -3767,6 +3888,7 @@ struct Renderer
 	u32 maxDescriptorCount;
 
 	GraphicsPipeline modelPipeline;
+	GraphicsPipeline linePipeline;
 
 	ID3D12Device2* device;
 	IDXGISwapChain4* swapChain;
@@ -3938,6 +4060,20 @@ static void setSceneBuffer(Renderer* renderer, SceneBuffer* sceneBuffer)
 	renderer->sceneBuffer = *sceneBuffer;
 }
 
+static void drawLines(Renderer* renderer, v3* points, u32 pointCount, v4 color)
+{
+	ASSERT(renderer->lineCount < renderer->maxLineSettingCount);
+	ASSERT(renderer->pointCount + pointCount <= renderer->maxPointCount);
+
+	DrawLineSetting* setting = renderer->drawLineSettings + renderer->lineCount++;
+	setting->color = color;
+	setting->firstPointIndex = renderer->pointCount;
+	setting->pointCount = pointCount;
+
+	memcpy(renderer->currentLineBuffer + renderer->pointCount, points, sizeof(v3) * pointCount);
+	renderer->pointCount += pointCount;
+}
+
 static void drawModel(Renderer* renderer, ModelBuffer* modelBuffer, GPUMesh* mesh, GPUDescriptorBinding* binding)
 {
 	ASSERT(renderer->modelCount < renderer->maxModelCount);
@@ -4026,20 +4162,20 @@ static void drawModel(Renderer* renderer, ModelBuffer* modelBuffer, GPUMesh* mes
 		ModelBuffer* uploadModelBuffer = renderer->currentModelBuffers + renderer->modelCount;
 		*uploadModelBuffer = modelBufferToUpload;
 
-		DrawSetting* drawSetting = renderer->drawSettings + renderer->modelCount;
+		DrawModelSetting* drawModelSetting = renderer->drawModelSettings + renderer->modelCount;
 
-		drawSetting->vb = mesh->vertexBuffer.d12View;
-		drawSetting->ib = mesh->indexBuffer.d12View;
-		drawSetting->indexCount = mesh->indexCount;
-		drawSetting->modelBufferIndex = renderer->modelCount;
+		drawModelSetting->vb = mesh->vertexBuffer.d12View;
+		drawModelSetting->ib = mesh->indexBuffer.d12View;
+		drawModelSetting->indexCount = mesh->indexCount;
+		drawModelSetting->modelBufferIndex = renderer->modelCount;
 
 		if (binding)
 		{
-			drawSetting->gpuDescriptorHandle = getGPUDescriptorHandle(renderer, binding->descriptorTableIndexInHeap);
+			drawModelSetting->gpuDescriptorHandle = getGPUDescriptorHandle(renderer, binding->descriptorTableIndexInHeap);
 		}
 		else
 		{
-			drawSetting->gpuDescriptorHandle.ptr = 0;
+			drawModelSetting->gpuDescriptorHandle.ptr = 0;
 		}
 
 		++renderer->modelCount;
@@ -4100,17 +4236,27 @@ static void submitRender(Renderer* renderer)
 		D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
 		D3D12_RESOURCE_STATE_COPY_DEST)
 	);
+	commandList->ResourceBarrier(1, &transition(frameResource->gpuLineBuffer.resource.d12Resource,
+		D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+		D3D12_RESOURCE_STATE_COPY_DEST)
+	);
 
 	u32 modelBuffersOffset = renderer->modelBuffersOffset + renderer->uploadHeapSizePerFrame*currentBackBufferIndex;
 	u32 sceneBufferOffset = renderer->sceneBufferOffset + renderer->uploadHeapSizePerFrame*currentBackBufferIndex;
+	u32 lineBufferOffset = renderer->lineBufferOffset + renderer->uploadHeapSizePerFrame*currentBackBufferIndex;
 	commandList->CopyBufferRegion(frameResource->gpuSceneBuffer.resource.d12Resource, 0, renderer->uploadHeap, sceneBufferOffset, sizeof(SceneBuffer));
 	commandList->CopyBufferRegion(frameResource->gpuModelBuffers.resource.d12Resource, 0, renderer->uploadHeap, modelBuffersOffset, sizeof(ModelBuffer)*renderer->modelCount);
+	commandList->CopyBufferRegion(frameResource->gpuLineBuffer.resource.d12Resource, 0, renderer->uploadHeap, lineBufferOffset, sizeof(v3)*renderer->pointCount);
 	
 	commandList->ResourceBarrier(1, &transition(frameResource->gpuSceneBuffer.resource.d12Resource,
 		D3D12_RESOURCE_STATE_COPY_DEST,
 		D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
 	);
 	commandList->ResourceBarrier(1, &transition(frameResource->gpuModelBuffers.resource.d12Resource,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
+	);
+	commandList->ResourceBarrier(1, &transition(frameResource->gpuLineBuffer.resource.d12Resource,
 		D3D12_RESOURCE_STATE_COPY_DEST,
 		D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
 	);
@@ -4122,18 +4268,33 @@ static void submitRender(Renderer* renderer)
 
 	for (u32 modelIndex = 0; modelIndex < renderer->modelCount; ++modelIndex)
 	{
-		DrawSetting* drawSetting = renderer->drawSettings + modelIndex;
+		DrawModelSetting* setting = renderer->drawModelSettings + modelIndex;
 
-		commandList->SetGraphicsRootConstantBufferView(2, frameResource->gpuModelBuffers.gpuVirtualAddress+ drawSetting->modelBufferIndex*sizeof(ModelBuffer));
+		commandList->SetGraphicsRootConstantBufferView(2, frameResource->gpuModelBuffers.gpuVirtualAddress+ setting->modelBufferIndex*sizeof(ModelBuffer));
 		
-		if (drawSetting->gpuDescriptorHandle.ptr)
+		if (setting->gpuDescriptorHandle.ptr)
 		{
-			commandList->SetGraphicsRootDescriptorTable(1, drawSetting->gpuDescriptorHandle);
+			commandList->SetGraphicsRootDescriptorTable(1, setting->gpuDescriptorHandle);
 		}
 
-		commandList->IASetIndexBuffer(&drawSetting->ib);
-		commandList->IASetVertexBuffers(0, 1, &drawSetting->vb);
-		commandList->DrawIndexedInstanced(drawSetting->indexCount, 1, 0, 0, 0);
+		commandList->IASetIndexBuffer(&setting->ib);
+		commandList->IASetVertexBuffers(0, 1, &setting->vb);
+		commandList->DrawIndexedInstanced(setting->indexCount, 1, 0, 0, 0);
+	}
+
+	if (renderer->pointCount)
+	{
+		commandList->SetPipelineState(renderer->linePipeline.pipeline);
+		commandList->SetGraphicsRootSignature(renderer->linePipeline.desc.pRootSignature);
+		commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
+		commandList->SetGraphicsRootConstantBufferView(0, frameResource->gpuSceneBuffer.gpuVirtualAddress);
+		commandList->IASetVertexBuffers(0, 1, &frameResource->gpuLineBuffer.d12View);
+
+		for (u32 lineIndex = 0; lineIndex < renderer->lineCount; ++lineIndex)
+		{
+			DrawLineSetting* setting = renderer->drawLineSettings + lineIndex;
+			commandList->DrawInstanced(setting->pointCount, 1, setting->firstPointIndex, 0);
+		}
 	}
 
 	//transition backbuffer state
@@ -4155,6 +4316,8 @@ static void submitRender(Renderer* renderer)
 	ASSERT(renderer->swapChain->Present(1, 0) == S_OK);
 
 	renderer->modelCount = 0;
+	renderer->lineCount = 0;
+	renderer->pointCount = 0;
 
 	//wait until next command allocator is available and reset command list from it
 	{
@@ -4162,6 +4325,7 @@ static void submitRender(Renderer* renderer)
 		frameResource = renderer->frameResources + currentBackBufferIndex;
 		renderer->currentModelBuffers = (ModelBuffer*)(renderer->uploadHeapBegin + renderer->modelBuffersOffset + renderer->uploadHeapSizePerFrame*currentBackBufferIndex);
 		renderer->currentSceneBuffer = (SceneBuffer*)(renderer->uploadHeapBegin + renderer->sceneBufferOffset + renderer->uploadHeapSizePerFrame*currentBackBufferIndex);
+		renderer->currentLineBuffer = (v3*)(renderer->uploadHeapBegin + renderer->lineBufferOffset + renderer->uploadHeapSizePerFrame*currentBackBufferIndex);
 
 		//START_TIMER(WaitForRenderFence);
 		waitForFenceValue(renderer->renderQueue.d12fence, frameResource->commandAllocator.requiredFenceValueForReset);
@@ -4172,12 +4336,15 @@ static void submitRender(Renderer* renderer)
 	}
 }
 
-static void createRenderer(Renderer* result, HWND window, ID3D12Device2* device, u32 maxModelCount, u32 maxDescriptorCount,
-	u32 backbufferWidth, u32 backbufferHeight, MemoryArena* arena)
+static void createRenderer(Renderer* result, HWND window, ID3D12Device2* device, u32 maxModelCount, u32 maxPointCount, u32 maxLineCount, 
+	u32 maxDescriptorCount, u32 backbufferWidth, u32 backbufferHeight, MemoryArena* arena)
 {
 	*result = {};
 	result->maxModelCount = maxModelCount;
-	result->drawSettings = pushArray(arena, result->maxModelCount, DrawSetting);
+	result->maxPointCount = maxPointCount;
+	result->maxLineSettingCount = maxLineCount;
+	result->drawModelSettings = pushArray(arena, result->maxModelCount, DrawModelSetting);
+	result->drawLineSettings = pushArray(arena, result->maxLineSettingCount, DrawLineSetting);
 	result->device = device;
 
 	result->backbufferHeight = backbufferHeight;
@@ -4251,6 +4418,7 @@ static void createRenderer(Renderer* result, HWND window, ID3D12Device2* device,
 
 		frameResource->gpuSceneBuffer = createConstantBuffer(device, sizeof(SceneBuffer), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 		frameResource->gpuModelBuffers = createConstantBuffer(device, sizeof(ModelBuffer)*result->maxModelCount, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		frameResource->gpuLineBuffer = createVertexBuffer(device, sizeof(v3) * result->maxPointCount, sizeof(v3), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
 		rtv.ptr += rtvDescriptorHandleSize;
 
@@ -4286,7 +4454,8 @@ static void createRenderer(Renderer* result, HWND window, ID3D12Device2* device,
 	//create upload heap
 	result->sceneBufferOffset = 0;
 	result->modelBuffersOffset = sizeof(SceneBuffer);
-	result->uploadHeapSizePerFrame = result->modelBuffersOffset + maxModelCount * sizeof(ModelBuffer);
+	result->lineBufferOffset = result->modelBuffersOffset + result->maxModelCount * sizeof(ModelBuffer);
+	result->uploadHeapSizePerFrame = result->lineBufferOffset + result->maxPointCount * sizeof(v3);
 	ASSERT(device->CreateCommittedResource(
 		&createHeapProperties(D3D12_HEAP_TYPE_UPLOAD),
 		D3D12_HEAP_FLAG_NONE,
@@ -4300,8 +4469,10 @@ static void createRenderer(Renderer* result, HWND window, ID3D12Device2* device,
 
 	result->currentModelBuffers = (ModelBuffer*)(result->uploadHeapBegin + result->modelBuffersOffset + result->uploadHeapSizePerFrame*currentBackBufferIndex);
 	result->currentSceneBuffer = (SceneBuffer*)(result->uploadHeapBegin + result->sceneBufferOffset + result->uploadHeapSizePerFrame*currentBackBufferIndex);
+	result->currentLineBuffer = (v3*)(result->uploadHeapBegin + result->lineBufferOffset + result->uploadHeapSizePerFrame*currentBackBufferIndex);
 
 	createHeightMappingPipeline(&result->modelPipeline, device);
+	createLineDrawingPipeline(&result->linePipeline, device);
 }
 
 static void allocateDescriptors(Renderer* renderer, GPUDescriptorBinding* binding)
@@ -4365,8 +4536,1330 @@ static void queueTestJob(void* data)
 	OutputDebugStringA(buff);
 }
 
+struct Matrix //let's say it's columnwise
+{
+	f32* data;
+	u32 columnCount;
+	u32 rowCount;
+
+	f32& e(u32 rowIndex, u32 columnIndex)
+	{
+		ASSERT(rowIndex < rowCount);
+		ASSERT(columnIndex < columnCount);
+		return *(data + rowCount * columnIndex + rowIndex);
+	}
+};
+
+struct Matrixd //let's say it's columnwise
+{
+	f64* data;
+	u32 columnCount;
+	u32 rowCount;
+
+	f64& e(u32 rowIndex, u32 columnIndex)
+	{
+		ASSERT(rowIndex < rowCount);
+		ASSERT(columnIndex < columnCount);
+		return *(data + rowCount * columnIndex + rowIndex);
+	}
+};
 
 
+inline Matrix pushMatrix(MemoryArena* arena, u32 rowCount, u32 columnCount)
+{
+	Matrix result = {};
+
+	result.data = pushArray(arena, rowCount*columnCount, f32);
+	ASSERT(result.data);
+	result.rowCount = rowCount;
+	result.columnCount = columnCount;
+
+	return result;
+}
+
+inline Matrixd pushMatrixd(MemoryArena* arena, u32 rowCount, u32 columnCount)
+{
+	Matrixd result = {};
+
+	result.data = pushArray(arena, rowCount*columnCount, f64);
+	ASSERT(result.data);
+	result.rowCount = rowCount;
+	result.columnCount = columnCount;
+
+	return result;
+}
+
+static Matrix multiply(Matrix result, Matrix A, Matrix B)
+{
+	ASSERT(A.columnCount == B.rowCount && A.rowCount == result.rowCount && B.columnCount == result.columnCount);
+	for (u32 j = 0; j < result.columnCount; ++j)
+	{
+		for (u32 i = 0; i < result.rowCount; ++i)
+		{
+			f32 sum = 0.f;
+			for (u32 k = 0; k < A.columnCount; ++k)
+			{
+				sum += A.e(i, k) * B.e(k, j);
+			}
+			result.e(i, j) = sum;
+		}
+	}
+	return result;
+}
+
+static Matrix multiply(MemoryArena* arena, Matrix A, Matrix B)
+{
+	Matrix result = pushMatrix(arena, A.rowCount, B.columnCount);
+	multiply(result, A, B);
+	return result;
+}
+
+static Matrixd multiply(Matrixd result, Matrixd A, Matrixd B)
+{
+	ASSERT(A.columnCount == B.rowCount && A.rowCount == result.rowCount && B.columnCount == result.columnCount);
+	for (u32 j = 0; j < result.columnCount; ++j)
+	{
+		for (u32 i = 0; i < result.rowCount; ++i)
+		{
+			f64 sum = 0.f;
+			for (u32 k = 0; k < A.columnCount; ++k)
+			{
+				sum += A.e(i, k) * B.e(k, j);
+			}
+			result.e(i, j) = sum;
+		}
+	}
+	return result;
+}
+
+static Matrixd multiply(MemoryArena* arena, Matrixd A, Matrixd B)
+{
+	Matrixd result = pushMatrixd(arena, A.rowCount, B.columnCount);
+	multiply(result, A, B);
+	return result;
+}
+
+static Matrix subtract(Matrix result, Matrix A, Matrix B)
+{
+	ASSERT(A.rowCount == B.rowCount && A.columnCount == B.columnCount);
+	ASSERT(result.columnCount == A.columnCount && result.rowCount == A.rowCount);
+
+	f32* a = A.data;
+	f32* b = B.data;
+	f32* r = result.data;
+	for (u32 index = 0; index < A.rowCount * A.columnCount; ++index)
+	{
+		*r++ = *a++ - *b++;
+	}
+	return result;
+}
+
+static Matrix subtract(MemoryArena* arena, Matrix A, Matrix B)
+{
+	Matrix result = pushMatrix(arena, A.rowCount, A.columnCount);
+	subtract(result, A, B);
+	return result;
+}
+
+static Matrixd subtract(Matrixd result, Matrixd A, Matrixd B)
+{
+	ASSERT(A.rowCount == B.rowCount && A.columnCount == B.columnCount);
+	ASSERT(result.columnCount == A.columnCount && result.rowCount == A.rowCount);
+
+	f64* a = A.data;
+	f64* b = B.data;
+	f64* r = result.data;
+	for (u32 index = 0; index < A.rowCount * A.columnCount; ++index)
+	{
+		*r++ = *a++ - *b++;
+	}
+	return result;
+}
+
+static Matrixd subtract(MemoryArena* arena, Matrixd A, Matrixd B)
+{
+	Matrixd result = pushMatrixd(arena, A.rowCount, A.columnCount);
+	subtract(result, A, B);
+	return result;
+}
+
+
+static Matrix add(Matrix result, Matrix A, Matrix B)
+{
+	ASSERT(A.rowCount == B.rowCount && A.columnCount == B.columnCount);
+	ASSERT(A.rowCount == result.rowCount && A.columnCount == result.columnCount);
+
+	f32* a = A.data;
+	f32* b = B.data;
+	f32* r = result.data;
+	for (u32 index = 0; index < A.rowCount * A.columnCount; ++index)
+	{
+		*r++ = *a++ + *b++;
+	}
+	return result;
+}
+
+static Matrix add(MemoryArena* arena, Matrix A, Matrix B)
+{
+	Matrix result = pushMatrix(arena, A.rowCount, A.columnCount);
+	add(result, A, B);
+	return result;
+}
+
+inline void setZero(Matrix A)
+{
+	memset(A.data, 0, sizeof(f32) * A.rowCount*A.columnCount);
+}
+
+inline void setIdentity(Matrix A)
+{
+	ASSERT(A.columnCount == A.rowCount);
+	setZero(A);
+	for (u32 i = 0; i < A.rowCount; ++i)
+	{
+		A.e(i, i) = 1.f;
+	}
+}
+
+inline void copyMatrix(Matrix dst, Matrix src)
+{
+	ASSERT(dst.columnCount == src.columnCount && dst.rowCount == src.rowCount);
+	memcpy(dst.data, src.data, sizeof(f32) * src.columnCount * src.rowCount);
+}
+
+inline void copyMatrix(Matrixd dst, Matrixd src)
+{
+	ASSERT(dst.columnCount == src.columnCount && dst.rowCount == src.rowCount);
+	memcpy(dst.data, src.data, sizeof(f64) * src.columnCount * src.rowCount);
+}
+
+static Matrix invertByGauss(MemoryArena* arena, Matrix A)
+{
+	ASSERT(A.columnCount == A.rowCount);
+
+	Matrix result = pushMatrix(arena, A.rowCount, A.columnCount);
+	setIdentity(result);
+	
+	TempMemory temp = startTempMemory(arena);
+	Matrix B = pushMatrix(arena, A.rowCount, A.columnCount);
+	copyMatrix(B, A); //B is the coefficient matrix
+
+	for (u32 rowIndex = 0; rowIndex < result.rowCount; ++rowIndex)
+	{
+		f32 div = B.e(rowIndex, rowIndex);
+		B.e(rowIndex,  rowIndex) = 1.f;
+		ASSERT(fabsf(div) > 1e-7f);
+		ASSERT(div != 0.f);
+		for (u32 columnIndex = rowIndex + 1; columnIndex < result.columnCount; ++columnIndex)
+		{
+			B.e(rowIndex, columnIndex) /= div;
+		}
+		for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex) 
+		{
+			result.e(rowIndex, columnIndex) /= div;
+		}
+
+		for (u32 rowIndex2 = rowIndex + 1; rowIndex2 < result.rowCount; ++rowIndex2)
+		{
+			f32 factor = -B.e(rowIndex2, rowIndex);
+			B.e(rowIndex2, rowIndex) = 0.f;
+
+			for (u32 columnIndex = rowIndex + 1; columnIndex < result.columnCount; ++columnIndex)
+			{
+				B.e(rowIndex2, columnIndex) += B.e(rowIndex, columnIndex) * factor;
+			}
+			for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+			{
+				result.e(rowIndex2, columnIndex) += result.e(rowIndex, columnIndex) * factor;
+			}
+		}
+	}
+
+	for (u32 rowIndex = result.rowCount - 1; rowIndex > 0; --rowIndex)
+	{
+		for (u32 rowIndex2 = 0; rowIndex2 < rowIndex; ++rowIndex2)
+		{
+			f32 factor = -B.e(rowIndex2, rowIndex);
+			B.e(rowIndex2, rowIndex) = 0.f;
+
+			for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+			{
+				result.e(rowIndex2, columnIndex) += result.e(rowIndex, columnIndex) * factor;
+			}
+		}
+	}
+
+	//validation
+	for (u32 j = 0; j < B.columnCount; ++j)
+	{
+		for (u32 i = 0; i < B.rowCount; ++i)
+		{
+			if (i == j)
+			{
+				ASSERT(B.e(i, j) == 1.f);
+			}
+			else
+			{
+				ASSERT(B.e(i, j) == 0.f);
+			}
+		}
+	}
+
+	Matrix I = multiply(arena, A, result);
+	for (u32 j = 0; j < I.columnCount; ++j)
+	{
+		for (u32 i = 0; i < I.rowCount; ++i)
+		{
+			if (i == j)
+			{
+				ASSERT(fabsf(I.e(i, j) - 1.f) < 1e-5f);
+			}
+			else
+			{
+				ASSERT(fabsf(I.e(i, j)) < 1e-5f);
+			}
+		}
+	}
+
+
+	endTempMemory(&temp);
+
+	return result;
+
+}
+
+static Matrix solveByGauss(MemoryArena* arena, Matrix result, Matrix A, Matrix b)
+{
+	ASSERT(A.columnCount == A.rowCount);
+	ASSERT(b.rowCount == A.rowCount);
+
+	TempMemory temp = startTempMemory(arena);
+	Matrix B = pushMatrix(arena, A.rowCount, A.columnCount);
+	copyMatrix(B, A); //B is the coefficient matrix
+	copyMatrix(result, b);
+
+
+	for (u32 rowIndex = 0; rowIndex < result.rowCount; ++rowIndex)
+	{
+		f32 div = B.e(rowIndex, rowIndex);
+		B.e(rowIndex, rowIndex) = 1.f;
+		ASSERT(fabsf(div) > 1e-7f);
+		ASSERT(div != 0.f);
+		for (u32 columnIndex = rowIndex + 1; columnIndex < B.columnCount; ++columnIndex)
+		{
+			B.e(rowIndex, columnIndex) /= div;
+		}
+		for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+		{
+			result.e(rowIndex, columnIndex) /= div;
+		}
+
+		for (u32 rowIndex2 = rowIndex + 1; rowIndex2 < result.rowCount; ++rowIndex2)
+		{
+			f32 factor = -B.e(rowIndex2, rowIndex);
+			B.e(rowIndex2, rowIndex) = 0.f;
+
+			for (u32 columnIndex = rowIndex + 1; columnIndex < B.columnCount; ++columnIndex)
+			{
+				B.e(rowIndex2, columnIndex) += B.e(rowIndex, columnIndex) * factor;
+			}
+			for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+			{
+				result.e(rowIndex2, columnIndex) += result.e(rowIndex, columnIndex) * factor;
+			}
+		}
+	}
+
+	for (u32 rowIndex = result.rowCount - 1; rowIndex > 0; --rowIndex)
+	{
+		for (u32 rowIndex2 = 0; rowIndex2 < rowIndex; ++rowIndex2)
+		{
+			f32 factor = -B.e(rowIndex2, rowIndex);
+			B.e(rowIndex2, rowIndex) = 0.f;
+
+			for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+			{
+				result.e(rowIndex2, columnIndex) += result.e(rowIndex, columnIndex) * factor;
+			}
+		}
+	}
+
+	//validation
+	for (u32 j = 0; j < B.columnCount; ++j)
+	{
+		for (u32 i = 0; i < B.rowCount; ++i)
+		{
+			if (i == j)
+			{
+				ASSERT(B.e(i, j) == 1.f);
+			}
+			else
+			{
+				ASSERT(B.e(i, j) == 0.f);
+			}
+		}
+	}
+
+	Matrix I = multiply(arena, A, result);
+	for (u32 j = 0; j < I.columnCount; ++j)
+	{
+		for (u32 i = 0; i < I.rowCount; ++i)
+		{
+			ASSERT(fabsf(I.e(i, j) - b.e(i, j)) < 1e-5f);
+		}
+	}
+
+	endTempMemory(&temp);
+
+	return result;
+}
+
+static Matrixd solveByGauss(MemoryArena* arena, Matrixd result, Matrixd A, Matrixd b)
+{
+	ASSERT(A.columnCount == A.rowCount);
+	ASSERT(b.rowCount == A.rowCount);
+
+	TempMemory temp = startTempMemory(arena);
+	Matrixd B = pushMatrixd(arena, A.rowCount, A.columnCount);
+	copyMatrix(B, A); //B is the coefficient matrix
+	copyMatrix(result, b);
+
+
+	for (u32 rowIndex = 0; rowIndex < result.rowCount; ++rowIndex)
+	{
+		f64 div = B.e(rowIndex, rowIndex);
+		B.e(rowIndex, rowIndex) = 1.;
+		ASSERT(fabs(div) > 1e-7);
+		ASSERT(div != 0.f);
+		for (u32 columnIndex = rowIndex + 1; columnIndex < B.columnCount; ++columnIndex)
+		{
+			B.e(rowIndex, columnIndex) /= div;
+		}
+		for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+		{
+			result.e(rowIndex, columnIndex) /= div;
+		}
+
+		for (u32 rowIndex2 = rowIndex + 1; rowIndex2 < result.rowCount; ++rowIndex2)
+		{
+			f64 factor = -B.e(rowIndex2, rowIndex);
+			B.e(rowIndex2, rowIndex) = 0.f;
+
+			for (u32 columnIndex = rowIndex + 1; columnIndex < B.columnCount; ++columnIndex)
+			{
+				B.e(rowIndex2, columnIndex) += B.e(rowIndex, columnIndex) * factor;
+			}
+			for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+			{
+				result.e(rowIndex2, columnIndex) += result.e(rowIndex, columnIndex) * factor;
+			}
+		}
+	}
+
+	for (u32 rowIndex = result.rowCount - 1; rowIndex > 0; --rowIndex)
+	{
+		for (u32 rowIndex2 = 0; rowIndex2 < rowIndex; ++rowIndex2)
+		{
+			f64 factor = -B.e(rowIndex2, rowIndex);
+			B.e(rowIndex2, rowIndex) = 0.f;
+
+			for (u32 columnIndex = 0; columnIndex < result.columnCount; ++columnIndex)
+			{
+				result.e(rowIndex2, columnIndex) += result.e(rowIndex, columnIndex) * factor;
+			}
+		}
+	}
+
+	//validation
+	for (u32 j = 0; j < B.columnCount; ++j)
+	{
+		for (u32 i = 0; i < B.rowCount; ++i)
+		{
+			if (i == j)
+			{
+				ASSERT(B.e(i, j) == 1.);
+			}
+			else
+			{
+				ASSERT(B.e(i, j) == 0.);
+			}
+		}
+	}
+
+	Matrixd I = multiply(arena, A, result);
+	for (u32 j = 0; j < I.columnCount; ++j)
+	{
+		for (u32 i = 0; i < I.rowCount; ++i)
+		{
+			ASSERT(fabs(I.e(i, j) - b.e(i, j)) < 1e-5);
+		}
+	}
+
+	endTempMemory(&temp);
+
+	return result;
+}
+
+struct Pendulum
+{
+	v3* q; //generalized coordinates (points on the sphere)
+	v3* dq; //generalized velocities (perpendicular to the generalized coordinates)
+	f32* l; // lengths of the strings from the previous pieces
+	f32* m; // masses of the pieces
+	u32 pieceCount;
+	f32 dragCoeff;
+	v3 dpivot; //velocity of the pivot point defined externally
+
+	v3* pos;
+};
+
+struct PendulumPartialResult
+{
+	v2* q;
+	v2* dq; // == dHdp
+	v2* p;
+	v2* dHdq;
+	m4* frames;
+	u32 pieceCount;
+
+	Matrix A;
+	Matrix b;
+};
+
+static f32 computeKineticEnergy(Pendulum* pendulum)
+{
+	f32 K = 0.f;
+	for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	{
+		for (u32 j = 0; j <= i; ++j)
+		{
+			for (u32 k = 0; k <= i; ++k)
+			{
+				K += pendulum->m[i] * pendulum->l[j] * pendulum->l[k] * dot(pendulum->dq[j], pendulum->dq[k]);
+			}
+		}
+	}
+	K *= 0.5f;
+	return K;
+}
+
+static f32 computePotentialEnergy(Pendulum* pendulum, v3 pivot)
+{
+	f32 V = 0.f;
+	v3 pos = pivot;
+	for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	{
+		pos += pendulum->l[i] * pendulum->q[i];
+		V += pendulum->m[i] * dot(G, pos);
+	}
+	return V;
+}
+
+static f32 computeHamiltonian(Pendulum* pendulum, v3 pivot)
+{
+	f32 K = computeKineticEnergy(pendulum);
+	f32 V = computePotentialEnergy(pendulum, pivot);
+	f32 H = K + V;
+	return H;
+}
+
+static Pendulum pushPendulum(MemoryArena* arena, u32 pieceCount)
+{
+	Pendulum result = {};
+
+	result.q = pushArray(arena, pieceCount, v3);
+	result.dq = pushArray(arena, pieceCount, v3);
+	result.m = pushArray(arena, pieceCount, f32);
+	result.l = pushArray(arena, pieceCount, f32);
+	result.pos = pushArray(arena, pieceCount + 1, v3);
+	result.pieceCount = pieceCount;
+
+	return result;
+}
+
+static PendulumPartialResult pushPendulumPartialResult(MemoryArena* arena, Pendulum* pendulum)
+{
+	PendulumPartialResult result = {};
+
+	result.A = pushMatrix(arena, pendulum->pieceCount * 2, pendulum->pieceCount * 2);
+	result.b = pushMatrix(arena, pendulum->pieceCount * 2, 1);
+
+	result.dHdq = pushArray(arena, pendulum->pieceCount, v2);
+	result.dq = pushArray(arena, pendulum->pieceCount, v2);
+	result.p = pushArray(arena, pendulum->pieceCount, v2);
+	result.q = pushArray(arena, pendulum->pieceCount, v2);
+	result.frames = pushArray(arena, pendulum->pieceCount, m4);
+
+	result.pieceCount = pendulum->pieceCount;
+
+	return result;
+}
+
+//static void createPendulum(Pendulum* result, v3* q, v3* dq, f32* l, f32* m, u32 pieceCount, f32 dragCoeff, v3 pivot, v3 dpivot)
+//{
+//	ASSERT(pieceCount < PENDULUM_MAX_PIECE_COUNT);
+//
+//	memcpy(result->q, q, pieceCount * sizeof(*q));
+//	memcpy(result->dq, dq, pieceCount * sizeof(*dq));
+//	memcpy(result->l, l, pieceCount * sizeof(*l));
+//	memcpy(result->m, m, pieceCount * sizeof(*m));
+//
+//	result->pieceCount = pieceCount;
+//	result->dragCoeff = dragCoeff;
+//	result->pivot = pivot;
+//	result->dpivot = dpivot;
+//	result->H = computeHamiltonian(result);
+//}
+
+static void globalToLocal(Pendulum* pendulum, PendulumPartialResult* data)
+{
+	for (u32 pieceIndex = 0; pieceIndex < pendulum->pieceCount; ++pieceIndex)
+	{
+		v3 q = pendulum->q[pieceIndex];
+		v3 dq = pendulum->dq[pieceIndex];
+
+		v3 a = angleAxisToRotation(pi32*0.5f, q) * dq;
+		f32 l = length(a);
+		if (l < 0.0001f)
+		{
+			a = cross({ 1.f, 0.f, 0.f }, q);
+			l = length(a);
+			if (l < 0.0001f)
+			{
+				a = cross({ 0.f, 0.f, 1.f }, q);
+				l = length(a);
+				ASSERT(l > 0.0001f);
+			}
+		}
+		a /= l;
+		v3 b = cross(q, a);
+
+		m4 frame = {};
+		frame.xAxis = a;
+		frame.yAxis = b;
+		frame.zAxis = q;
+		data->frames[pieceIndex] = frame;
+
+		v2 qloc = { 0.25f, 0.5f };
+		data->q[pieceIndex] = qloc;
+		
+		//if (a_is_dq)
+		//{
+		//	v2 dqloc = { l / DspherePosAtBase().e[0][0], 0.f};
+		//	data->dq[pieceIndex] = dqloc;
+		//}
+		//else
+		{
+			v2 dqloc = { dot(dq,a) / DspherePosAtBase().e[0][0], dot(dq,b) / DspherePosAtBase().e[1][1]};
+			data->dq[pieceIndex] = dqloc;
+		}
+		v2 dqloc = data->dq[pieceIndex];
+
+		ASSERT(lengthSq(frame * spherePosAtBase() - q) == 0.f);
+		//ASSERT(lengthSq(frame * DspherePosAtBase() * dqloc - dq) <= 0.01);
+	}
+}
+
+static void localToGlobal(Pendulum* pendulum, PendulumPartialResult* data)
+{
+	for (u32 pieceIndex = 0; pieceIndex < pendulum->pieceCount; ++pieceIndex)
+	{
+		v2 qloc = data->q[pieceIndex];
+		v2 dqloc = data->dq[pieceIndex];
+		m4 frame = data->frames[pieceIndex];
+
+		for (u32 i = 0; i < 3; ++i)
+		{
+			ASSERT(lengthSq(frame.c[i]) < 1.5f);
+		}
+
+		if (qloc.x != 0.25f || qloc.y != 0.5f)
+		{
+			v3 q = frame * spherePos(qloc.x, qloc.y);
+			q = normalize(q);
+			ASSERT(length(q - pendulum->q[pieceIndex]) < 1.f);
+			pendulum->q[pieceIndex] = q;
+		}
+		
+		v3 q = pendulum->q[pieceIndex];
+		if (qloc.x != 0.25f || qloc.y != 0.5f)
+		{
+			v3 dq = frame * DspherePos(qloc.x, qloc.y) * dqloc;
+			dq = dq - dot(dq, q)*q;
+			ASSERT(length(dq- pendulum->dq[pieceIndex]) < 10000000.f)
+			pendulum->dq[pieceIndex] = dq;
+		}
+		else
+		{
+			v3 dq = frame * DspherePosAtBase() * dqloc;
+			ASSERT(length(dq - pendulum->dq[pieceIndex]) < 100.f)
+			pendulum->dq[pieceIndex] = dq;
+		}
+	}
+}
+
+static void computeAAtBase(Pendulum* pendulum, PendulumPartialResult* data)
+{
+	for (u32 j = 0; j < pendulum->pieceCount; ++j)
+	{
+		for (u32 i = 0; i < pendulum->pieceCount; ++i)
+		{
+			f32 m = 0.f;
+			for (u32 k = MAX(i, j); k < pendulum->pieceCount; ++k)
+			{
+				m += pendulum->m[k];
+			}
+			f32 c = m * pendulum->l[i] * pendulum->l[j];
+
+			m3x2 frameiDspherei = data->frames[i] * DspherePosAtBase();
+			m3x2 framejDspherej = data->frames[j] * DspherePosAtBase();
+
+			m2 A = transposeMul(frameiDspherei, framejDspherej);
+
+			for (u32 l = 0; l < 2; ++l)
+			{
+				for (u32 k = 0; k < 2; ++k)
+				{
+					data->A.e(2 * i + l, 2 * j + k) = c * A.e[k][l];
+				}
+			}
+		}
+	}
+
+
+	//setZero(data->A);
+
+	//for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	//{
+	//	for (u32 j = 0; j <= i; ++j)
+	//	{
+	//		for (u32 k = 0; k <= i; ++k)
+	//		{
+	//			f32 c = pendulum->m[i] * pendulum->l[j] * pendulum->l[k];
+	//
+	//			m3x2 framejDspherej = data->frames[j] * DspherePosAtBase();
+	//			m3x2 framekDspherek = data->frames[k] * DspherePosAtBase();
+	//
+	//			m2 A = transposeMul(framejDspherej, framekDspherek);
+	//
+	//			for (u32 l = 0; l < 2; ++l)
+	//			{
+	//				for (u32 m = 0; m < 2; ++m)
+	//				{
+	//					data->A.e(2 * j + l, 2 * k + m) += c * A.e[m][l];
+	//				}
+	//			}
+	//		}
+	//	}
+	//}
+}
+
+static void computeA(Pendulum* pendulum, PendulumPartialResult* data)
+{
+	for (u32 j = 0; j < pendulum->pieceCount; ++j)
+	{
+		for (u32 i = 0; i < pendulum->pieceCount; ++i)
+		{
+			f32 m = 0.f;
+			for (u32 k = MAX(i, j); k < pendulum->pieceCount; ++k)
+			{
+				m += pendulum->m[k];
+			}
+			f32 c = m * pendulum->l[i] * pendulum->l[j];
+
+			v2 qi = data->q[i];
+			v2 qj = data->q[j];
+
+			m3x2 frameiDspherei;
+			if (qi.x == 0.25f && qi.y == 0.5f)
+			{
+				frameiDspherei = data->frames[i] * DspherePosAtBase();
+			}
+			else
+			{
+				frameiDspherei = data->frames[i] * DspherePos(qi.x, qi.y);
+			}
+			m3x2 framejDspherej;
+			if (qj.x == 0.25f && qj.y == 0.5f)
+			{
+				framejDspherej = data->frames[j] * DspherePosAtBase();
+			}
+			else
+			{
+				framejDspherej = data->frames[j] * DspherePos(qj.x, qj.y);
+			}
+
+			m2 A = transposeMul(frameiDspherei, framejDspherej);
+
+			for (u32 l = 0; l < 2; ++l)
+			{
+				for (u32 k = 0; k < 2; ++k)
+				{
+					ASSERT(fabsf(c*A.e[k][l]) < 100.f);
+					data->A.e(2 * i + l, 2 * j + k) = c * A.e[k][l];
+				}
+			}
+		}
+	}
+}
+
+static void computebAtBase(Pendulum* pendulum, PendulumPartialResult* data)
+{
+	for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	{
+		f32 m = 0.f;
+		for (u32 j = i; j < pendulum->pieceCount; ++j)
+		{
+			m += pendulum->m[j];
+		}
+
+		v2 b = pendulum->dpivot * (data->frames[i] * DspherePosAtBase());
+		b *= m * pendulum->l[i];
+
+		data->b.e(2 * i + 0, 0) = b.x;
+		data->b.e(2 * i + 1, 0) = b.y;
+	}
+}
+
+static void computeb(Pendulum* pendulum, PendulumPartialResult* data)
+{
+	for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	{
+		f32 m = 0.f;
+		for (u32 j = i; j < pendulum->pieceCount; ++j)
+		{
+			m += pendulum->m[j];
+		}
+
+		v2 qi = data->q[i];
+
+		m3x2 Dspherei;
+		if (qi.x == 0.25f && qi.y == 0.5f)
+		{
+			Dspherei = DspherePosAtBase();
+		}
+		else
+		{
+			Dspherei = DspherePos(qi.x, qi.y);
+		}
+
+		v2 b = pendulum->dpivot * (data->frames[i] * Dspherei);
+		b *= m * pendulum->l[i];
+
+		data->b.e(2 * i + 0, 0) = b.x;
+		data->b.e(2 * i + 1, 0) = b.y;
+	}
+}
+
+static Matrix wrapToMatrix(f32* data, u32 rowCount, u32 columnCount)
+{
+	Matrix result;
+	result.data = data;
+	result.rowCount = rowCount;
+	result.columnCount = columnCount;
+	return result;
+}
+
+static Matrix wrapToVector(f32* data, u32 size)
+{
+	Matrix result;
+	result.data = data;
+	result.rowCount = size;
+	result.columnCount = 1;
+	return result;
+}
+
+static f32 dot(Matrix v, Matrix w)
+{
+	ASSERT(v.columnCount == 1 && w.columnCount == 1 && v.rowCount == w.rowCount);
+	
+	f32 result = 0.f;
+
+	f32* vi = v.data;
+	f32* wi = w.data;
+	for (u32 i = 0; i < v.rowCount; ++i)
+	{
+		result += *vi++ * *wi++;
+	}
+	return result;
+}
+
+static void computepFromdq(MemoryArena* arena, PendulumPartialResult* data)
+{
+	//p = A * dq + b
+	TempMemory temp = startTempMemory(arena);
+
+	Matrix dq = wrapToVector(data->dq->e, data->pieceCount * 2);
+	Matrix p = wrapToVector(data->p->e, data->pieceCount * 2);
+
+	add(p, multiply(arena, data->A, dq), data->b);
+
+	endTempMemory(&temp);
+}
+
+static Matrixd toMatrixd(Matrixd result, Matrix A)
+{
+	ASSERT(result.columnCount == A.columnCount && result.rowCount == A.rowCount);
+	
+	f64* r = result.data;
+	f32* a = A.data;
+	for (u32 i = 0; i < result.columnCount*result.rowCount; ++i)
+	{
+		*r++ = *a++;
+	}
+	return result;
+}
+
+static Matrixd toMatrixd(MemoryArena* arena, Matrix A)
+{
+	return toMatrixd(pushMatrixd(arena, A.rowCount, A.columnCount), A);
+}
+
+static Matrix toMatrix(Matrix result, Matrixd A)
+{
+	ASSERT(result.columnCount == A.columnCount && result.rowCount == A.rowCount);
+
+	f32* r = result.data;
+	f64* a = A.data;
+	for (u32 i = 0; i < result.columnCount*result.rowCount; ++i)
+	{
+		*r++ = (f32)*a++;
+	}
+	return result;
+}
+
+static void computedqFromp(MemoryArena* arena, PendulumPartialResult* data)
+{
+	//dq = inv(A) * (p - b)
+	TempMemory temp = startTempMemory(arena);
+
+	Matrixd p = toMatrixd(arena, wrapToVector(data->p->e, data->pieceCount * 2));
+	Matrixd dq = pushMatrixd(arena, data->pieceCount * 2, 1);
+	
+	Matrixd A = toMatrixd(arena, data->A);
+	Matrixd b = toMatrixd(arena, data->b);
+	solveByGauss(arena, dq, A, subtract(arena, p, b));
+	
+	toMatrix(wrapToVector(data->dq->e, data->pieceCount * 2), dq);
+
+	//Matrix p = wrapToVector(data->p->e, data->pieceCount * 2);
+	//Matrix dq = wrapToVector(data->dq->e, data->pieceCount * 2);
+	//
+	//solveByGauss(arena, dq, data->A, subtract(arena, p, data->b));
+	//multiply(dq, invertByGauss(arena, data->A), subtract(arena, p, data->b));
+
+	endTempMemory(&temp);
+}
+
+static void createdAdqAtBase(Matrix* duPart, Matrix* dvPart, MemoryArena* arena, Pendulum* pendulum, PendulumPartialResult* data, u32 r)
+{
+	setZero(*duPart);
+	setZero(*dvPart);
+
+	m3x2 dDspherePosdu;
+	m3x2 dDspherePosdv;
+	DDspherePosAtBase(&dDspherePosdu, &dDspherePosdv);
+
+	m3x2 M = data->frames[r] * dDspherePosdu;
+	m3x2 N = data->frames[r] * dDspherePosdv;
+
+	for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	{
+		f32 m = 0.f;
+		for (u32 k = MAX(i, r); k < pendulum->pieceCount; ++k)
+		{
+			m += pendulum->m[k];
+		}
+
+		m3x2 frameiDspherei = data->frames[i] * DspherePosAtBase();
+
+		m2 dAdu = transposeMul(frameiDspherei, M);
+		m2 dAdv = transposeMul(frameiDspherei, N);
+
+		f32 c = m * pendulum->l[r] * pendulum->l[i];
+		dAdu = c * dAdu;
+		dAdv = c * dAdv;
+
+		for (u32 l = 0; l < 2; ++l)
+		{
+			for (u32 k = 0; k < 2; ++k)
+			{
+				duPart->e(2 * i + l, 2 * r + k) = dAdu.e[k][l];
+				dvPart->e(2 * i + l, 2 * r + k) = dAdv.e[k][l];
+
+				duPart->e(2 * r + l, 2 * i + k) += dAdu.e[l][k];
+				dvPart->e(2 * r + l, 2 * i + k) += dAdv.e[l][k];
+			}
+		}
+	}
+
+	//for (u32 i = 0; i < pendulum->pieceCount; ++i)
+	//{
+	//	for (u32 j = 0; j <= i; ++j)
+	//	{
+	//		for (u32 k = 0; k <= i; ++k)
+	//		{
+	//			m4 framej = data->frames[j];
+	//			m4 framek = data->frames[k];
+	//
+	//			m2 dAdu = {};
+	//			m2 dAdv = {};
+	//
+	//			if (j == r)
+	//			{
+	//				m3x2 dDspherePosdu;
+	//				m3x2 dDspherePosdv;
+	//				DDspherePosAtBase(&dDspherePosdu, &dDspherePosdv);
+	//
+	//				m3x2 DspherePosk = DspherePosAtBase();
+	//
+	//				dAdu = dAdu + transposeMul(framej * dDspherePosdu, framek * DspherePosk);
+	//				dAdv = dAdv + transposeMul(framej * dDspherePosdv, framek * DspherePosk);
+	//			}
+	//			if (k == r)
+	//			{
+	//				m3x2 dDspherePosdu;
+	//				m3x2 dDspherePosdv;
+	//				DDspherePosAtBase(&dDspherePosdu, &dDspherePosdv);
+	//
+	//				m3x2 DspherePosj = DspherePosAtBase();
+	//
+	//				dAdu = dAdu + transposeMul(framej * DspherePosj, framek * dDspherePosdu);
+	//				dAdv = dAdv + transposeMul(framej * DspherePosj, framek * dDspherePosdv);
+	//			}
+	//			if (j == r || k == r)
+	//			{
+	//
+	//				f32 c = pendulum->m[i] * pendulum->l[j] * pendulum->l[k];
+	//				for (u32 l = 0; l < 2; ++l)
+	//				{
+	//					for (u32 m = 0; m < 2; ++m)
+	//					{
+	//						duPart->e(2 * j + l, 2 * k + m) += c * dAdu.e[m][l];
+	//						dvPart->e(2 * j + l, 2 * k + m) += c * dAdv.e[m][l];
+	//					}
+	//				}
+	//			}
+	//		}
+	//	}
+	//}
+}
+
+static f32 quadraticForm(MemoryArena* arena, Matrix v, Matrix A, Matrix w) //< v, Aw >
+{
+	ASSERT(v.columnCount == 1 && w.columnCount == 1);
+	ASSERT(v.rowCount == A.rowCount && w.rowCount == A.columnCount);
+
+	TempMemory temp = startTempMemory(arena);
+
+	f32 result = dot(v, multiply(arena, A, w));
+
+	endTempMemory(&temp);
+	return result;
+}
+
+static void computedHdqAtBase(MemoryArena* arena, Pendulum* pendulum, PendulumPartialResult* data)
+{
+	// dH/dq = 0.5 * < p - b, dinvA/dq * p - b > + dV/dq = -0.5 * < dq, dA/dq * dq > + dV/dq
+
+	TempMemory temp = startTempMemory(arena);
+	Matrix dAdqu = pushMatrix(arena, pendulum->pieceCount * 2, pendulum->pieceCount * 2);
+	Matrix dAdqv = pushMatrix(arena, pendulum->pieceCount * 2, pendulum->pieceCount * 2);
+
+	Matrix dq = wrapToVector(data->dq->e, data->pieceCount * 2);
+
+	for (u32 pieceIndex = 0; pieceIndex < pendulum->pieceCount; ++pieceIndex)
+	{
+		f32 m = 0.f;
+		for (u32 i = pieceIndex; i < pendulum->pieceCount; ++i)
+		{
+			m += pendulum->m[i];
+		}
+		v2 dVdq = m * pendulum->l[pieceIndex] * G * (data->frames[pieceIndex] * DspherePosAtBase());
+
+		createdAdqAtBase(&dAdqu, &dAdqv, arena, pendulum, data, pieceIndex);
+
+		v2 dKdq =
+		{
+			-0.5f * quadraticForm(arena, dq, dAdqu, dq),
+			-0.5f * quadraticForm(arena, dq, dAdqv, dq)
+		};
+
+		v2 dHdq = dVdq + dKdq;
+
+		data->dHdq[pieceIndex] = dHdq;
+		//ASSERT(length(dHdq) < 1000.f);
+	}
+
+	endTempMemory(&temp);
+}
+
+static void validateNumbers(f32* numbers, u32 count)
+{
+	for (u32 i = 0; i < count; ++i)
+	{
+		ASSERT(!isnan(*numbers) && !isinf(*numbers));
+		++numbers;
+	}
+}
+
+static void validateMatrix(Matrix A)
+{
+	validateNumbers(A.data, A.rowCount*A.columnCount);
+}
+
+static void updatePendulum(MemoryArena* arena, Pendulum* pendulum, v3 dpivot, f32 dt)
+{
+	u32 iterCount = 30;
+	dt /= (f32)iterCount;
+
+	v3 dpivotStart = pendulum->dpivot;
+	v3 dpivotEnd = dpivot;
+
+	TempMemory temp = startTempMemory(arena);
+
+	PendulumPartialResult data = pushPendulumPartialResult(arena, pendulum);
+
+	for (u32 iter = 0; iter < iterCount; ++iter)
+	{
+		umm arenaOffset = arena->offset;
+
+		globalToLocal(pendulum, &data);
+		validateNumbers(data.q->e, data.pieceCount * 2);
+		validateNumbers(data.dq->e, data.pieceCount * 2);
+
+		computeAAtBase(pendulum, &data);
+		validateMatrix(data.A);
+
+		computebAtBase(pendulum, &data);
+		validateMatrix(data.b);
+
+		computepFromdq(arena, &data);
+		validateNumbers(data.p->e, data.pieceCount * 2);
+
+		computedHdqAtBase(arena, pendulum, &data);
+		validateNumbers(data.dHdq->e, data.pieceCount * 2);
+
+		for (u32 pieceIndex = 0; pieceIndex < pendulum->pieceCount; ++pieceIndex)
+		{
+			v2 dqdt = data.dq[pieceIndex]; // == dHdp
+			v2 dpdt = -data.dHdq[pieceIndex];
+			
+			data.q[pieceIndex] += dqdt * dt;
+			data.p[pieceIndex] += dpdt * dt;
+
+			v2 drag = -pendulum->dragCoeff * data.p[pieceIndex] * dt;
+			//data.p[pieceIndex] += drag;
+			
+			if (fabsf(drag.x) >= fabsf(data.p[pieceIndex].x))
+			{
+				data.p[pieceIndex].x = 0.f;
+			}
+			else
+			{
+				data.p[pieceIndex].x += drag.x;
+			}
+			if (fabsf(drag.y) >= fabsf(data.p[pieceIndex].y))
+			{
+				data.p[pieceIndex].y = 0.f;
+			}
+			else
+			{
+				data.p[pieceIndex].y += drag.y;
+			}
+		}
+		pendulum->dpivot = lerp(dpivotStart, dpivotEnd, (f32)iter / (f32)(iterCount-1));
+
+		computeA(pendulum, &data);
+		validateMatrix(data.A);
+
+		computeb(pendulum, &data);
+		validateMatrix(data.b);
+
+		computedqFromp(arena, &data);
+		validateNumbers(data.dq->e, data.pieceCount * 2);
+
+		localToGlobal(pendulum, &data);
+
+		ASSERT(arenaOffset == arena->offset); // just check for leaks
+	}
+	
+	endTempMemory(&temp);
+}
+
+static void computePiecePositions(Pendulum* pendulum, v3 pivot) //result[0] is the pivot point
+{
+	pendulum->pos[0] = pivot;
+	v3 pos = pivot;
+	for (u32 pieceIndex = 0; pieceIndex < pendulum->pieceCount; ++pieceIndex)
+	{
+		pos += pendulum->l[pieceIndex] * pendulum->q[pieceIndex];
+		pendulum->pos[pieceIndex + 1] = pos;
+	}
+}
+
+struct Hair
+{
+	Pendulum* fibers;
+	v4* pivots;
+	u32 fiberCount;
+	m4 prevHairToWorld;
+};
+
+static Hair createHair(MemoryArena* arena, u32 fiberCountU, u32 fiberCountV, u32 pieceCount, 
+	f32 lCoeff, f32 l0, f32 m0, f32 headR, f32 dragCoeff, m4 hairToWorld)
+{
+	u32 fiberCount = fiberCountU * fiberCountV;
+
+	Hair result = {};
+	result.fibers = pushArray(arena, fiberCount, Pendulum);
+	result.pivots = pushArray(arena, fiberCount, v4);
+	result.fiberCount = fiberCount;
+	result.prevHairToWorld = hairToWorld;
+
+	u32 fiberIndex = 0;
+
+	m4 Rot = rotationX(-0.5f * pi32);
+
+	for (u32 fiberIndexV = 0; fiberIndexV < fiberCountV; ++fiberIndexV)
+	{
+		f32 v = 0.25f + 0.5f * (f32)fiberIndexV / (f32)(fiberCountV - 1); //in [0.25, 0.75]
+
+		for (u32 fiberIndexU = 0; fiberIndexU < fiberCountU; ++fiberIndexU)
+		{
+			f32 u = 0.125f + 0.25f * (f32)fiberIndexU / (f32)(fiberCountU - 1); //in [0.125, 0.375]
+			result.pivots[fiberIndex] = headR * Rot * V4(spherePos(u, v), 1.f);
+
+			Pendulum* fiber = result.fibers + fiberIndex;
+
+			*fiber = pushPendulum(arena, pieceCount);
+			fiber->dragCoeff = dragCoeff;
+
+			f32 m = m0;
+			f32 l = l0;
+			for (u32 pieceIndex = 0; pieceIndex < fiber->pieceCount; ++pieceIndex)
+			{
+				fiber->q[pieceIndex] = { 1.f, 0.f, 0.f };
+				fiber->dq[pieceIndex] = {};
+				fiber->m[pieceIndex] = m;
+				fiber->l[pieceIndex] = l;
+
+				l *= lCoeff;
+				m *= lCoeff; //constant density is assumed
+			}
+
+			++fiberIndex;
+		}
+	}
+
+	return result;
+}
+
+static void updateHair(MemoryArena* arena, Hair* hair, m4 hairToWorld, f32 dt)
+{
+	m4 dhairToWorld = (hairToWorld - hair->prevHairToWorld) * (1.f/ dt);
+	dhairToWorld.e[3][3] = 1.f;
+	for (u32 fiberIndex = 0; fiberIndex < hair->fiberCount; ++fiberIndex)
+	{
+		v4 dpivot = dhairToWorld * hair->pivots[fiberIndex];
+		ASSERT(length(dpivot) < 20.f);
+
+		Pendulum* fiber = hair->fibers + fiberIndex;
+
+		updatePendulum(arena, fiber, dpivot.xyz, dt);
+		computePiecePositions(fiber, hair->pivots[fiberIndex].xyz + hairToWorld.translation);
+	}
+	hair->prevHairToWorld = hairToWorld;
+}
+
+struct SmoothCamera
+{
+	v2 angle;
+	v3 pos;
+
+	v2 dangle;
+	v3 dpos;
+	f32 posDrag;
+	f32 angleDrag;
+
+	f32 ddangleLength;
+	f32 ddwalkLength;
+	f32 ddelevationLength;
+	f32 maxAngleXAbs;
+
+	m4 model;
+	m4 view;
+};
+
+static void updateSmoothCamera(SmoothCamera* cam, Input* input, f32 dt)
+{
+	v2 ddangle = {};
+	if (input->left.isDown) { ddangle.y += 1.f; }
+	if (input->right.isDown) { ddangle.y -= 1.f; }
+	if (input->up.isDown) { ddangle.x += 1.f; }
+	if (input->down.isDown) { ddangle.x -= 1.f; }
+
+	if (ddangle.x != 0.f || ddangle.y != 0.f)
+	{
+		ddangle = cam->ddangleLength * normalize(ddangle);
+	}
+
+	ddangle -= cam->angleDrag * cam->dangle;
+	cam->angle += cam->dangle * dt + 0.5f * ddangle * dt * dt;
+	cam->dangle += ddangle * dt;
+
+	if (cam->angle.x < -cam->maxAngleXAbs)
+	{
+		cam->angle.x = -cam->maxAngleXAbs;
+		cam->dangle.x = 0.f; //TODO: this should also be smooth
+	}
+	else if (cam->maxAngleXAbs < cam->angle.x)
+	{
+		cam->angle.x = cam->maxAngleXAbs;
+		cam->dangle.x = 0.f;
+	}
+	if (cam->angle.y < -pi32)
+	{
+		cam->angle.y += 2.f * pi32;
+	}
+	else if (pi32 < cam->angle.y)
+	{
+		cam->angle.y -= 2.f *  pi32;
+	}
+
+
+	cam->model = rotationY(cam->angle.y) * rotationX(cam->angle.x);
+	ASSERT(cam->model.xAxis.y == 0.f);
+
+	v3 ddpos = {};
+	if (input->W.isDown) { ddpos.z -= 1.f; }
+	if (input->S.isDown) { ddpos.z += 1.f; }
+	if (input->A.isDown) { ddpos.x -= 1.f; }
+	if (input->D.isDown) { ddpos.x += 1.f; }
+
+	if (ddpos.x != 0.f || ddpos.z != 0.f)
+	{
+		ddpos = cam->model.xAxis * ddpos.x + cam->model.zAxis * ddpos.z;
+		ddpos.y = 0.f;
+		ddpos = cam->ddwalkLength * normalizeSafe(ddpos);
+	}
+
+	f32 elevation = 0.f;
+	if (input->space.isDown) { elevation += 1.f; }
+	if (input->C.isDown) { elevation -= 1.f; }
+
+	if (elevation != 0.f)
+	{
+		ddpos.y = cam->ddelevationLength * elevation;
+	}
+
+	ddpos -= cam->posDrag * cam->dpos;
+	cam->pos += cam->dpos * dt + 0.5f * ddpos * dt * dt;
+	cam->dpos += ddpos * dt;
+
+	cam->model.translation = cam->pos;
+	cam->view = invertOrtho3Translation(cam->model);
+}
 
 int CALLBACK WinMain(
 	HINSTANCE hInstance,
@@ -4469,9 +5962,9 @@ int CALLBACK WinMain(
 
 	// Suppress individual messages by their ID
 	D3D12_MESSAGE_ID denyIds[] = {
-		D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,   // I'm really not sure how to avoid this message.
-		D3D12_MESSAGE_ID_MAP_INVALID_NULLRANGE,                         // This warning occurs when using capture frame while graphics debugging.
-		D3D12_MESSAGE_ID_UNMAP_INVALID_NULLRANGE,                       // This warning occurs when using capture frame while graphics debugging.
+		D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,
+		D3D12_MESSAGE_ID_MAP_INVALID_NULLRANGE,
+		D3D12_MESSAGE_ID_UNMAP_INVALID_NULLRANGE,
 	};
 
 	D3D12_INFO_QUEUE_FILTER newFilter = {};
@@ -4487,7 +5980,7 @@ int CALLBACK WinMain(
 
 	ResourceManager resourceManager = createResourceManager(device);
 	Renderer renderer = {};
-	createRenderer(&renderer, window, device, 1024, 128, 1920, 1080, &arena);
+	createRenderer(&renderer, window, device, 1024, 2048, 1000, 128, 1920, 1080, &arena);
 
 	//GraphicsPipeline terrainPipeline = createTerrainPipeline(device);
 	//GraphicsPipeline fractalPipeline = createFractalPipeline(device);
@@ -4628,23 +6121,74 @@ int CALLBACK WinMain(
 
 	m4 proj = projection((f32)renderer.backbufferWidth / (f32)renderer.backbufferHeight, pi32 * 0.5f, 0.1f, 500.f);
 
-	f32 walkSpeed = 8.f;
-	f32 elevationSpeed = 8.f;
-	f32 rotationSpeed = pi32 * 0.25f;
-	v3 cameraPos = {};
-	v2 cameraRot = {};
-	f32 maxCameraRotXAbs = pi32 * 0.5f * 0.9f;
+	SmoothCamera cam = {};
+	cam.ddangleLength = pi32 * 0.25f;
+	cam.ddwalkLength = 8.f;
+	cam.ddelevationLength = 8.f;
+	cam.angleDrag = cam.ddangleLength * 2.f;
+	cam.posDrag = cam.ddwalkLength * 2.f;
+	cam.maxAngleXAbs = pi32 * 0.5f * 0.9f;
 
-	f32 dt = 0;
+	f32 dt = 0.016f;
+
+	m4 hairToWorld = translation({ 0.f, 0.f, -5.f });
+
+	Hair hair = createHair(&arena, 
+		2, //fiberCountU
+		2, //fiberCountV
+		6, //pieceCount
+		1.1f, //lCoeff
+		0.2f, // l0
+		0.1f, //m0
+		1.f, //headR
+		1.f, //dragCoeff
+		hairToWorld);
+	//Pendulum pendulum = pushPendulum(&arena, 3);
+	//
+	//pendulum.q[0] = spherePos(0.f, 0.f);
+	//pendulum.q[1] = spherePos(0.f, 0.f);
+	//pendulum.q[2] = spherePos(0.f, 0.6f);
+	//
+	//pendulum.dq[0] = {};
+	//pendulum.dq[1] = {};
+	//pendulum.dq[2] = {};
+	//
+	//pendulum.m[0] = 1.f;
+	//pendulum.m[1] = 1.f;
+	//pendulum.m[2] = 1.f;
+	//
+	//pendulum.l[0] = 1.f;
+	//pendulum.l[1] = 1.5f;
+	//pendulum.l[2] = 2.f;
+	//
+	//pendulum.dragCoeff = 0.5f;
+	//
+	//v3 pendulumPivot = { 0.f, 0.f, -5.f };
+	//v3 dpendulumPivot = {0.f, 0.f, 0.f};
+	//
+	//pendulum.dpivot = dpendulumPivot;
+
 	while (g_running)
 	{
 		updateInput(&input);
 		Win32ProcessPendingMessages(&input);
-
+		 
 		if (wasPressed(&input.tab))
 		{
 			Win32ToggleFullScreen(window, &windowPlacement);
 		}
+		//if (wasPressed(&input.C))
+		//{
+		//	//dpendulumPivot *= -1.f;
+		//	if (dpendulumPivot.x == 0.f)
+		//	{
+		//		dpendulumPivot.x = 5.f;
+		//	}
+		//	else
+		//	{
+		//		dpendulumPivot.x = 0.f;
+		//	}
+		//}
 
 		if (shouldRebuildGraphicspipeline(&input, &renderer.modelPipeline))
 		{
@@ -4652,73 +6196,32 @@ int CALLBACK WinMain(
 			rebuildGraphicsPipeline(device, &renderer.modelPipeline);
 		}
 
-		updateFractal(&coldQueue, &fractal, dt);
-		updateFractal(&hotQueue, &coloredFractal, dt);
-		updateFractal(&coldQueue, &heightMapFractal, dt);
+		//updateFractal(&coldQueue, &fractal, dt);
+		//updateFractal(&hotQueue, &coloredFractal, dt);
+		//updateFractal(&coldQueue, &heightMapFractal, dt);
+		//
+		//updateGPUFractal(&resourceManager, &renderer, &fractal, &gpuFractal);
+		//updateGPUFractal(&resourceManager, &renderer, &coloredFractal, &gpuColoredFractal);
+		//updateGPUFractal(&resourceManager, &renderer, &heightMapFractal, &gpuHeightMapFractal);
 
-		updateGPUFractal(&resourceManager, &renderer, &fractal, &gpuFractal);
-		updateGPUFractal(&resourceManager, &renderer, &coloredFractal, &gpuColoredFractal);
-		updateGPUFractal(&resourceManager, &renderer, &heightMapFractal, &gpuHeightMapFractal);
+		//updatePendulum(&arena, &pendulum, dpendulumPivot, dt);
+		//computePiecePositions(&pendulum, pendulumPivot);
+		//{
+		//	char buffer[256];
+		//	sprintf_s(buffer, "Hamiltonian: %f\n", computeHamiltonian(&pendulum, pendulumPivot));
+		//	OutputDebugStringA(buffer);
+		//}
 
 		//set cameraModel, update it from input
-		m4 cameraModel = {};
+		updateSmoothCamera(&cam, &input, dt);
+
+		hairToWorld = cam.model;
+		hairToWorld.translation -= 5.f * hairToWorld.zAxis;
+		updateHair(&arena, &hair, hairToWorld, dt);
 		{
-			v2 drot = {};
-			if (input.left.isDown) { drot.y += 1.f; }
-			if (input.right.isDown) { drot.y -= 1.f; }
-			if (input.up.isDown) { drot.x += 1.f; }
-			if (input.down.isDown) { drot.x -= 1.f; }
-
-			if (drot.x != 0.f || drot.y != 0.f)
-			{
-				drot = rotationSpeed * dt * normalize(drot);
-				cameraRot += drot;
-				if (cameraRot.x < -maxCameraRotXAbs)
-				{
-					cameraRot.x = -maxCameraRotXAbs;
-				}
-				else if (maxCameraRotXAbs < cameraRot.x)
-				{
-					cameraRot.x = maxCameraRotXAbs;
-				}
-				if (cameraRot.y < -pi32)
-				{
-					cameraRot.y += 2.f * pi32;
-				}
-				else if (pi32 < cameraRot.y)
-				{
-					cameraRot.y -=2.f *  pi32;
-				}
-			}
-
-			cameraModel = rotationY(cameraRot.y) * rotationX(cameraRot.x);
-			ASSERT(cameraModel.xAxis.y == 0.f);
-			
-			v3 moveInput = {};
-			if (input.W.isDown) { moveInput.z -= 1.f; }
-			if (input.S.isDown) { moveInput.z += 1.f; }
-			if (input.A.isDown) { moveInput.x -= 1.f; }
-			if (input.D.isDown) { moveInput.x += 1.f; }
-
-			if (moveInput.x != 0.f || moveInput.z != 0.f)
-			{
-				v3 dwalk = moveInput.x * cameraModel.xAxis + moveInput.z * cameraModel.zAxis;
-				dwalk.y = 0.f;
-				dwalk = walkSpeed * dt * normalizeSafe(dwalk);
-				cameraPos += dwalk;
-			}
-
-			f32 elevation = 0.f;
-			if (input.space.isDown) { elevation += 1.f; }
-			if (input.C.isDown) { elevation -= 1.f; }
-
-			if (elevation != 0.f)
-			{
-				elevation *= elevationSpeed * dt;
-				cameraPos.y += elevation;
-			}
-			cameraModel.translation = cameraPos;
-
+			char buffer[256];
+			sprintf_s(buffer, "Hamiltonian: %f\n", computeHamiltonian(hair.fibers, {}));
+			OutputDebugStringA(buffer);
 		}
 
 		//update model matrices
@@ -4757,15 +6260,14 @@ int CALLBACK WinMain(
 			}
 		}
 
-		lights[0].pos = (cameraModel*v4{ 0.f, 0.25f, -0.5f, 1.f }).xyz;
-		lights[1].pos = (cameraModel*v4{ -0.45f, 0.f, -0.5f, 1.f }).xyz;
-		lights[2].pos = (cameraModel*v4{ 0.45f, 0.f, -0.5f, 1.f }).xyz;
+		lights[0].pos = (cam.model*v4{ 0.f, 0.25f, -0.5f, 1.f }).xyz;
+		lights[1].pos = (cam.model*v4{ -0.45f, 0.f, -0.5f, 1.f }).xyz;
+		lights[2].pos = (cam.model*v4{ 0.45f, 0.f, -0.5f, 1.f }).xyz;
 
 		SceneBuffer sceneBuffer = {};
-		m4 view = invertOrtho3Translation(cameraModel);
-		m4 projview = proj * view;
+		m4 projview = proj * cam.view;
 		sceneBuffer.projview = projview;
-		sceneBuffer.viewPos = cameraPos;
+		sceneBuffer.viewPos = cam.pos;
 
 		sceneBuffer.lightCount = ARRAY_SIZE(lights);
 		for (u32 lightIndex = 0; lightIndex < sceneBuffer.lightCount; ++lightIndex)
@@ -4810,20 +6312,35 @@ int CALLBACK WinMain(
 			}
 		}
 
-		ModelBuffer planeBuffer = {};
-		planeBuffer.model = translation({ 50.f, 0.f, -20.f })*rotationY(pi32)*rotationX(-pi32 * 0.5f);
-		planeBuffer.fractalZoomScale = fractal.zoomFactor;
-		planeBuffer.fractalIndex = gpuFractal.imageIndex;
-		planeBuffer.scale = 1.f;
-		planeBuffer.color = renderer.clearColor;
-
-		//drawModel
-		//(
-		//	&renderer,
-		//	&planeBuffer,
-		//	gpuMeshes + 3,
-		//	gpuBindings + 2
-		//);
+		//draw hair
+		{
+			for (u32 fiberIndex = 0; fiberIndex < hair.fiberCount; ++fiberIndex)
+			{
+				Pendulum* fiber = hair.fibers + fiberIndex;
+				drawLines(&renderer, fiber->pos, fiber->pieceCount + 1, {179.f/255.f, 58.f/255.f, 0.f, 1.f});
+			}
+			//ModelBuffer buffs[4] = {};
+			//
+			//buffs[0].model = translation(pendulum.pos[0]);
+			//buffs[1].model = translation(pendulum.pos[1]);
+			//buffs[2].model = translation(pendulum.pos[2]);
+			//buffs[3].model = translation(pendulum.pos[3]);
+			//
+			//buffs[0].scale = 0.3f;
+			//buffs[1].scale = 0.3f;
+			//buffs[2].scale = 0.3f;
+			//buffs[3].scale = 0.3f;
+			//
+			//buffs[0].color = { 1.f, 1.f, 1.f };
+			//buffs[1].color.r = 1.f;
+			//buffs[2].color.g = 1.f;
+			//buffs[3].color.b = 1.f;
+			//
+			//drawModel(&renderer, buffs+0, &gpuLightMesh, 0);
+			//drawModel(&renderer, buffs+1, &gpuLightMesh, 0);
+			//drawModel(&renderer, buffs+2, &gpuLightMesh, 0);
+			//drawModel(&renderer, buffs+3, &gpuLightMesh, 0);
+		}
 
 		//draw lights
 		{
@@ -4840,20 +6357,20 @@ int CALLBACK WinMain(
 		//draw sky
 		{
 			ModelBuffer skyModel = {};
-			skyModel.model = translation(cameraPos);
+			skyModel.model = translation(cam.pos);
 			skyModel.scale = 100.f;
 			skyModel.fractalZoomScale = fractal.zoomFactor;
 			skyModel.fractalIndex = gpuFractal.imageIndex;
 			skyModel.color = renderer.clearColor;
 			skyModel.emissionScale = 1.f;
 
-			drawModel
-			(
-				&renderer,
-				&skyModel,
-				&gpuSkyMesh,
-				gpuBindings + 3
-			);
+			//drawModel
+			//(
+			//	&renderer,
+			//	&skyModel,
+			//	&gpuSkyMesh,
+			//	gpuBindings + 3
+			//);
 		}
 
 		submitRender(&renderer);

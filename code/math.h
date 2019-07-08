@@ -3,6 +3,16 @@
 #include "platform.h"
 #include <math.h>
 
+inline f32 pow(f32 a, u32 n)
+{
+	f32 result = 1.f;
+	for (u32 i = 0; i < n; ++i)
+	{
+		result *= a;
+	}
+	return result;
+}
+
 union v2
 {
 	struct
@@ -411,6 +421,47 @@ inline m4 operator*(m4 a, m4 b)
 	}
 	return r;
 }
+
+inline m4 operator+(m4 a, m4 b)
+{
+	m4 r = {};
+	for (u32 c = 0; c < 4; ++c)
+	{
+		r.c[c] = a.c[c] + b.c[c];
+	}
+	return r;
+}
+
+inline m4 operator-(m4 a, m4 b)
+{
+	m4 r = {};
+	for (u32 c = 0; c < 4; ++c)
+	{
+		r.c[c] = a.c[c] - b.c[c];
+	}
+	return r;
+}
+
+inline m4 operator*(m4 m, f32 a)
+{
+	m4 r = {};
+	for (u32 c = 0; c < 4; ++c)
+	{
+		r.c[c] = m.c[c] * a;
+	}
+	return r;
+}
+
+inline m4 operator*(f32 a, m4 m)
+{
+	m4 r = {};
+	for (u32 c = 0; c < 4; ++c)
+	{
+		r.c[c] = a * m.c[c];
+	}
+	return r;
+}
+
 inline m4 rotationX(f32 angle)
 {
 	m4 r;
@@ -516,6 +567,55 @@ inline m4 translation(v3 translation)
 	return r;
 }
 
+inline m4 scaleOrientation(m4 transform, f32 scale)
+{
+	m4 result = transform;
+	result.xAxis *= scale;
+	result.yAxis *= scale;
+	result.zAxis *= scale;
+	return result;
+}
+
+inline m4 crossProductMatrix(v3 v)
+{
+	m4 result = {};
+	result.e[3][3] = 1.f;
+
+	result.e[0][1] = v.z;
+	result.e[0][2] = -v.y;
+	result.e[1][0] = -v.z;
+	result.e[1][2] = v.x;
+	result.e[2][0] = v.y;
+	result.e[2][1] = -v.x;
+
+	return result;
+}
+
+inline m4 tensorProductMatrix(v3 v, v3 w) //v * transpose(w)
+{
+	m4 result = {};
+	result.e[3][3] = 1.f;
+
+	result.xAxis = w.x * v;
+	result.yAxis = w.y * v;
+	result.zAxis = w.z * v;
+
+	return result;
+}
+
+inline m4 angleAxisToRotation(f32 angle, v3 axis)
+{
+	axis = normalize(axis);
+
+	f32 _cos = cosf(angle);
+	f32 _sin = sinf(angle);
+
+	m4 result =  scaleOrientation(identityM4(), _cos) + scaleOrientation(crossProductMatrix(axis), _sin) + scaleOrientation(tensorProductMatrix(axis, axis), 1.f - _cos);
+	result.e[3][3] = 1.f;
+
+	return result;
+}
+
 union m3x2
 {
 	v3 c[2];
@@ -528,7 +628,20 @@ union m2
 	f32 e[2][2];
 };
 
-m3x2 operator*(m3x2 a, m2 b)
+inline m2 operator*(m2 m, f32 a)
+{
+	m2 result;
+	result.c[0] = m.c[0] * a;
+	result.c[1] = m.c[1] * a;
+	return result;
+}
+
+inline m2 operator*(f32 a, m2 m)
+{
+	return m * a;
+}
+
+inline m3x2 operator*(m3x2 a, m2 b)
 {
 	m3x2 result;
 	result.c[0] = b.c[0].x*a.c[0] + b.c[0].y*a.c[1];
@@ -537,8 +650,75 @@ m3x2 operator*(m3x2 a, m2 b)
 	return result;
 }
 
+inline v2 operator*(m2 m, v2 v)
+{
+	return m.c[0] * v.x + m.c[1] * v.y;
+}
+
+inline v3 operator*(m4 m, v3 v)
+{
+	return m.xAxis * v.x + m.yAxis * v.y + m.zAxis * v.z;
+}
+
+inline m2 operator+(m2 a, m2 b)
+{
+	m2 result;
+	result.c[0] = a.c[0] + b.c[0];
+	result.c[1] = a.c[1] + b.c[1];
+	return result;
+}
+
+inline m2 inverse(m2 m)
+{
+	f32 det = cross(m.c[0], m.c[1]);
+	ASSERT(det != 0.f);
+
+	m2 result;
+	result.e[0][0] = m.e[1][1];
+	result.e[0][1] = -m.e[0][1];
+	result.e[1][0] = -m.e[1][0];
+	result.e[1][1] = m.e[0][0];
+	result = result * (1.f / det);
+	return result;
+}
+
+inline m2 transposeMul(m3x2 m, m3x2 n) //transpose(m)*n
+{
+	m2 result =
+	{
+		dot(m.c[0], n.c[0]), dot(m.c[1], n.c[0]),
+		dot(m.c[0], n.c[1]), dot(m.c[1], n.c[1])
+	};
+	return result;
+}
+
+inline v2 operator*(v3 v, m3x2 m)
+{
+	v2 result =
+	{
+		dot(v, m.c[0]),
+		dot(v, m.c[1])
+	};
+	return result;
+}
+
+inline v3 operator*(m3x2 m, v2 v)
+{
+	return m.c[0] * v.x + m.c[1] * v.y;
+}
+
+inline m3x2 operator*(m4 m, m3x2 n)
+{
+	m3x2 result;
+	result.c[0] = m * n.c[0];
+	result.c[1] = m * n.c[1];
+	return result;
+}
+
 inline v3 spherePos(f32 u, f32 v)
 {
+	ASSERT(!isnan(u) && !isnan(v));
+
 	u *= 2.f * pi32;
 	v *= pi32;
 
@@ -560,6 +740,8 @@ inline v3 spherePos(f32 u, f32 v)
 
 inline m3x2 DspherePos(f32 u, f32 v)
 {
+	ASSERT(!isnan(u) && !isnan(v));
+
 	u *= 2.f * pi32;
 	v *= pi32;
 
@@ -585,6 +767,73 @@ inline m3x2 DspherePos(f32 u, f32 v)
 	};
 
 	return result;
+}
+
+inline v3 spherePosAtBase() // at (0.25, 0.5)
+{
+	return { 0.f, 0.f, 1.f };
+}
+
+inline m3x2 DspherePosAtBase()
+{
+	m3x2 result;
+	result.c[0] = 
+	{
+		-2.f*pi32,
+		0.f,
+		0.f
+	};
+	result.c[1] =
+	{
+		0.f,
+		-pi32,
+		0.f
+	};
+	return result;
+}
+
+inline void DDspherePos(m3x2* dDspherePosdu, m3x2* dDspherePosdv, f32 u, f32 v)
+{
+	ASSERT(!isnan(u) && !isnan(v));
+
+	u *= 2.f * pi32;
+	v *= pi32;
+
+	f32 cos_u = cosf(u);
+	f32 sin_u = sinf(u);
+
+	f32 cos_v = cosf(v);
+	f32 sin_v = sinf(v);
+
+	dDspherePosdu->c[0] =
+	{
+		-4.f*pi32*pi32*cos_u*sin_v,
+		0.f,
+		-4.f*pi32*pi32*sin_u*sin_v
+	};
+	dDspherePosdu->c[1] =
+	{
+		-2.f*pi32*sin_u*pi32*cos_v,
+		0.f,
+		2.f*pi32*cos_u*pi32*cos_v
+	};
+
+	dDspherePosdv->c[0] = dDspherePosdu->c[1]; //dudv = dvdu
+
+	dDspherePosdv->c[1] =
+	{
+		-cos_u*pi32*pi32*sin_v,
+		-pi32*pi32*cos_v,
+		-sin_u*pi32*pi32*sin_v
+	};
+}
+
+inline void DDspherePosAtBase(m3x2* dDspherePosdu, m3x2* dDspherePosdv)
+{
+	dDspherePosdu->c[0] = { 0.f, 0.f, -4.f * pi32 * pi32 };
+	dDspherePosdu->c[1] = { 0.f, 0.f, 0.f };
+	dDspherePosdv->c[0] = { 0.f, 0.f, 0.f };
+	dDspherePosdv->c[1] = { 0.f, 0.f, -pi32 * pi32 };
 }
 
 inline v4 sphereShapeOp(f32 u, f32 v)
@@ -759,6 +1008,8 @@ struct ClipRect
 	u32 minY;
 	u32 maxY;
 };
+
+
 
 //AVX
 inline __m256 operator+(__m256 a, __m256 b)
